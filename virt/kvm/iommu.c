@@ -133,6 +133,8 @@ int kvm_assign_device(struct kvm *kvm,
 			goto out_unmap;
 	}
 
+	pdev->dev_flags |= PCI_DEV_FLAGS_ASSIGNED;
+
 	printk(KERN_DEBUG "assign device: host bdf = %x:%x:%x\n",
 		assigned_dev->host_busnr,
 		PCI_SLOT(assigned_dev->host_devfn),
@@ -160,6 +162,8 @@ int kvm_deassign_device(struct kvm *kvm,
 
 	iommu_detach_device(domain, &pdev->dev);
 
+	pdev->dev_flags &= ~PCI_DEV_FLAGS_ASSIGNED;
+
 	printk(KERN_DEBUG "deassign device: host bdf = %x:%x:%x\n",
 		assigned_dev->host_busnr,
 		PCI_SLOT(assigned_dev->host_devfn),
@@ -177,9 +181,13 @@ int kvm_iommu_map_guest(struct kvm *kvm)
 		return -ENODEV;
 	}
 
+	mutex_lock(&kvm->slots_lock);
+
 	kvm->arch.iommu_domain = iommu_domain_alloc();
-	if (!kvm->arch.iommu_domain)
-		return -ENOMEM;
+	if (!kvm->arch.iommu_domain) {
+		r = -ENOMEM;
+		goto out_unlock;
+	}
 
 	if (!allow_unsafe_assigned_interrupts &&
 	    !iommu_domain_has_cap(kvm->arch.iommu_domain,
@@ -187,17 +195,16 @@ int kvm_iommu_map_guest(struct kvm *kvm)
 		printk(KERN_WARNING "%s: No interrupt remapping support, disallowing device assignment.  Re-enble with \"allow_unsafe_assigned_interrupts=1\" module option.\n", __func__);
 		iommu_domain_free(kvm->arch.iommu_domain);
 		kvm->arch.iommu_domain = NULL;
-		return -EPERM;
+		r = -EPERM;
+		goto out_unlock;
 	}
 
 	r = kvm_iommu_map_memslots(kvm);
 	if (r)
-		goto out_unmap;
+		kvm_iommu_unmap_memslots(kvm);
 
-	return 0;
-
-out_unmap:
-	kvm_iommu_unmap_memslots(kvm);
+out_unlock:
+	mutex_unlock(&kvm->slots_lock);
 	return r;
 }
 
@@ -224,6 +231,11 @@ static void kvm_iommu_put_pages(struct kvm *kvm,
 	iommu_unmap_range(domain, gfn_to_gpa(base_gfn), PAGE_SIZE * npages);
 }
 
+void kvm_iommu_unmap_pages(struct kvm *kvm, struct kvm_memory_slot *slot)
+{
+	kvm_iommu_put_pages(kvm, slot->base_gfn, slot->npages);
+}
+
 static int kvm_iommu_unmap_memslots(struct kvm *kvm)
 {
 	int i;
@@ -232,8 +244,7 @@ static int kvm_iommu_unmap_memslots(struct kvm *kvm)
 	slots = rcu_dereference(kvm->memslots);
 
 	for (i = 0; i < slots->nmemslots; i++) {
-		kvm_iommu_put_pages(kvm, slots->memslots[i].base_gfn,
-				    slots->memslots[i].npages);
+		kvm_iommu_unmap_pages(kvm, &slots->memslots[i]);
 	}
 
 	return 0;
@@ -247,7 +258,11 @@ int kvm_iommu_unmap_guest(struct kvm *kvm)
 	if (!domain)
 		return 0;
 
+	mutex_lock(&kvm->slots_lock);
 	kvm_iommu_unmap_memslots(kvm);
+	kvm->arch.iommu_domain = NULL;
+	mutex_unlock(&kvm->slots_lock);
+
 	iommu_domain_free(domain);
 	return 0;
 }

@@ -197,6 +197,11 @@ static int proc_taint(struct ctl_table *table, int write,
 			       void __user *buffer, size_t *lenp, loff_t *ppos);
 #endif
 
+#ifdef CONFIG_PRINTK
+static int proc_dmesg_restrict(struct ctl_table *table, int write,
+				void __user *buffer, size_t *lenp, loff_t *ppos);
+#endif
+
 static struct ctl_table root_table[];
 static struct ctl_table_root sysctl_table_root;
 static struct ctl_table_header root_table_header = {
@@ -833,7 +838,7 @@ static struct ctl_table kern_table[] = {
 		.data           = &dmesg_restrict,
 		.maxlen         = sizeof(int),
 		.mode           = 0644,
-		.proc_handler   = proc_dointvec_minmax,
+		.proc_handler   = proc_dmesg_restrict,
 		.extra1         = &zero,
 		.extra2         = &one,
 	},
@@ -1623,7 +1628,7 @@ static struct ctl_table fs_table[] = {
 	{
 		.procname	= "file-nr",
 		.data		= &files_stat,
-		.maxlen		= 3*sizeof(int),
+		.maxlen		= sizeof(files_stat),
 		.mode		= 0444,
 		.proc_handler	= &proc_nr_files,
 	},
@@ -1631,9 +1636,10 @@ static struct ctl_table fs_table[] = {
 		.ctl_name	= FS_MAXFILE,
 		.procname	= "file-max",
 		.data		= &files_stat.max_files,
-		.maxlen		= sizeof(int),
+		.maxlen		= sizeof(files_stat.max_files),
 		.mode		= 0644,
-		.proc_handler	= &proc_dointvec,
+		.proc_handler	= &proc_doulongvec_minmax,
+		.strategy	= &sysctl_data,
 	},
 	{
 		.ctl_name	= CTL_UNNUMBERED,
@@ -2807,6 +2813,17 @@ static int proc_taint(struct ctl_table *table, int write,
 
 	return err;
 }
+
+#ifdef CONFIG_PRINTK
+static int proc_dmesg_restrict(struct ctl_table *table, int write,
+				void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	if (write && !capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	return proc_dointvec_minmax(table, write, buffer, lenp, ppos);
+}
+#endif
 
 struct do_proc_dointvec_minmax_conv_param {
 	int *min;

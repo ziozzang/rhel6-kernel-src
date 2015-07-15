@@ -1121,6 +1121,8 @@ void jbd2_journal_update_superblock(journal_t *journal, int wait)
 	} else
 		write_dirty_buffer(bh, WRITE);
 
+	trace_jbd2_update_superblock_end(journal, wait);
+
 out:
 	/* If we have just flushed the log (by marking s_start==0), then
 	 * any future commit will have to be careful to update the
@@ -1184,6 +1186,14 @@ static int journal_get_superblock(journal_t *journal)
 		journal->j_maxlen = be32_to_cpu(sb->s_maxlen);
 	else if (be32_to_cpu(sb->s_maxlen) > journal->j_maxlen) {
 		printk (KERN_WARNING "JBD: journal file too short\n");
+		goto out;
+	}
+
+	if (be32_to_cpu(sb->s_first) == 0 ||
+	    be32_to_cpu(sb->s_first) >= journal->j_maxlen) {
+		printk(KERN_WARNING
+			"JBD2: Invalid start block of journal: %u\n",
+			be32_to_cpu(sb->s_first));
 		goto out;
 	}
 

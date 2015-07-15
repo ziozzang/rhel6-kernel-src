@@ -142,7 +142,7 @@ extern int nr_processes(void);
 extern unsigned long nr_running(void);
 extern unsigned long nr_uninterruptible(void);
 extern unsigned long nr_iowait(void);
-extern unsigned long nr_iowait_cpu(void);
+extern unsigned long nr_iowait_cpu(int cpu);
 extern unsigned long this_cpu_load(void);
 
 
@@ -277,6 +277,8 @@ static inline void select_nohz_load_balancer(int stop_tick) { }
  * Only dump TASK_* tasks. (0 for all tasks)
  */
 extern void show_state_filter(unsigned long state_filter);
+
+extern void wait_for_rqlock(void);
 
 static inline void show_state(void)
 {
@@ -685,6 +687,8 @@ struct signal_struct {
 	int oom_score_adj;	/* OOM kill score adjustment */
 	int oom_score_adj_min;	/* OOM kill score adjustment minimum value.
 				 * Only settable by CAP_SYS_RESOURCE. */
+	
+	cputime_t prev_utime, prev_stime;
 #endif
 };
 
@@ -1634,11 +1638,19 @@ struct task_struct {
 	unsigned long rh_reserved[2];
 #ifndef __GENKSYMS__
 	struct perf_event_context *perf_event_ctxp[perf_nr_task_contexts];
+#ifdef CONFIG_CGROUP_MEM_RES_CTLR /* memcg uses this to do batch job */
+	struct memcg_batch_info {
+		int do_batch;	/* incremented when batch uncharge started */
+		struct mem_cgroup *memcg; /* target memcg of uncharge */
+		unsigned long bytes; 		/* uncharged usage */
+		unsigned long memsw_bytes; /* uncharged mem+swap usage */
+	} memcg_batch;
+#endif
 #endif
 };
 
 /* Future-safe accessor for struct task_struct's cpus_allowed. */
-#define tsk_cpumask(tsk) (&(tsk)->cpus_allowed)
+#define tsk_cpus_allowed(tsk) (&(tsk)->cpus_allowed)
 
 /*
  * Priority of a process goes from 0..MAX_PRIO-1, valid RT
@@ -1816,9 +1828,8 @@ static inline void put_task_struct(struct task_struct *t)
 		__put_task_struct(t);
 }
 
-extern cputime_t task_utime(struct task_struct *p);
-extern cputime_t task_stime(struct task_struct *p);
-extern cputime_t task_gtime(struct task_struct *p);
+extern void task_times(struct task_struct *p, cputime_t *ut, cputime_t *st);
+extern void thread_group_times(struct task_struct *p, cputime_t *ut, cputime_t *st);
 
 /*
  * Per process flags
@@ -2249,6 +2260,12 @@ static inline void mmdrop(struct mm_struct * mm)
 extern void mmput(struct mm_struct *);
 /* Grab a reference to a task's mm, if it is not already going away */
 extern struct mm_struct *get_task_mm(struct task_struct *task);
+/*
+ * Grab a reference to a task's mm, if it is not already going away
+ * and ptrace_may_access with the mode parameter passed to it
+ * succeeds.
+ */
+extern struct mm_struct *mm_access(struct task_struct *task, unsigned int mode);
 /* Remove the current tasks stale references to the old mm_struct */
 extern void mm_release(struct task_struct *, struct mm_struct *);
 /* Allocate a new mm structure and copy contents from tsk->mm */
@@ -2280,8 +2297,10 @@ extern void set_task_comm(struct task_struct *tsk, char *from);
 extern char *get_task_comm(char *to, struct task_struct *tsk);
 
 #ifdef CONFIG_SMP
+void scheduler_ipi(void);
 extern unsigned long wait_task_inactive(struct task_struct *, long match_state);
 #else
+static inline void scheduler_ipi(void) { }
 static inline unsigned long wait_task_inactive(struct task_struct *p,
 					       long match_state)
 {
@@ -2523,9 +2542,9 @@ extern int __cond_resched_lock(spinlock_t *lock);
 
 extern int __cond_resched_softirq(void);
 
-#define cond_resched_softirq() ({				\
-	__might_sleep(__FILE__, __LINE__, SOFTIRQ_OFFSET);	\
-	__cond_resched_softirq();				\
+#define cond_resched_softirq() ({					\
+	__might_sleep(__FILE__, __LINE__, SOFTIRQ_DISABLE_OFFSET);	\
+	__cond_resched_softirq();					\
 })
 
 /*

@@ -488,10 +488,13 @@ static void sd_config_discard(struct scsi_disk *sdkp, unsigned int mode)
 	unsigned int max_blocks = 0;
 
 	q->limits.discard_zeroes_data = sdkp->lbprz;
-	q->limits.discard_alignment = sdkp->unmap_alignment;
+	q->limits.discard_alignment = sdkp->unmap_alignment *
+		logical_block_size;
 	q->limits.discard_granularity =
 		max(sdkp->physical_block_size,
 		    sdkp->unmap_granularity * logical_block_size);
+
+	sdkp->provisioning_mode = mode;
 
 	switch (mode) {
 
@@ -520,8 +523,6 @@ static void sd_config_discard(struct scsi_disk *sdkp, unsigned int mode)
 
 	q->limits.max_discard_sectors = max_blocks * (logical_block_size >> 9);
 	queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, q);
-
-	sdkp->provisioning_mode = mode;
 }
 
 /**
@@ -1058,6 +1059,10 @@ static int sd_ioctl(struct block_device *bdev, fmode_t mode,
 	SCSI_LOG_IOCTL(1, printk("sd_ioctl: disk=%s, cmd=0x%x\n",
 						disk->disk_name, cmd));
 
+	error = scsi_verify_blk_ioctl(bdev, cmd);
+	if (error < 0)
+		return error;
+
 	/*
 	 * If we are in the middle of error recovery, don't let anyone
 	 * else try and use this device.  Also, if error recovery fails, it
@@ -1079,7 +1084,7 @@ static int sd_ioctl(struct block_device *bdev, fmode_t mode,
 		case SCSI_IOCTL_GET_BUS_NUMBER:
 			return scsi_ioctl(sdp, cmd, p);
 		default:
-			error = scsi_cmd_ioctl(disk->queue, disk, mode, cmd, p);
+			error = scsi_cmd_blk_ioctl(bdev, mode, cmd, p);
 			if (error != -ENOTTY)
 				return error;
 	}
@@ -1228,6 +1233,11 @@ static int sd_compat_ioctl(struct block_device *bdev, fmode_t mode,
 			   unsigned int cmd, unsigned long arg)
 {
 	struct scsi_device *sdev = scsi_disk(bdev->bd_disk)->device;
+	int ret;
+
+	ret = scsi_verify_blk_ioctl(bdev, cmd);
+	if (ret < 0)
+		return ret;
 
 	/*
 	 * If we are in the middle of error recovery, don't let anyone
@@ -1239,8 +1249,6 @@ static int sd_compat_ioctl(struct block_device *bdev, fmode_t mode,
 		return -ENODEV;
 	       
 	if (sdev->host->hostt->compat_ioctl) {
-		int ret;
-
 		ret = sdev->host->hostt->compat_ioctl(sdev, cmd, (void __user *)arg);
 
 		return ret;
@@ -2139,7 +2147,7 @@ void sd_read_app_tag_own(struct scsi_disk *sdkp, unsigned char *buffer)
 static void sd_read_block_limits(struct scsi_disk *sdkp)
 {
 	unsigned int sector_sz = sdkp->device->sector_size;
-	const int vpd_len = 32;
+	const int vpd_len = 64;
 	unsigned char *buffer = kmalloc(vpd_len, GFP_KERNEL);
 
 	if (!buffer ||
@@ -2206,7 +2214,7 @@ static void sd_read_block_characteristics(struct scsi_disk *sdkp)
 {
 	unsigned char *buffer;
 	u16 rot;
-	const int vpd_len = 32;
+	const int vpd_len = 64;
 
 	buffer = kmalloc(vpd_len, GFP_KERNEL);
 

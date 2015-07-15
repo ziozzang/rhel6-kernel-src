@@ -40,6 +40,9 @@
 #define KVM_REQ_CLOCK_UPDATE       8
 #define KVM_REQ_KICK               9
 #define KVM_REQ_DEACTIVATE_FPU    10
+#define KVM_REQ_STEAL_UPDATE      13
+#define KVM_REQ_PMU               16
+#define KVM_REQ_PMI               17
 
 #define KVM_USERSPACE_IRQ_SOURCE_ID	0
 
@@ -251,7 +254,7 @@ void kvm_vcpu_uninit(struct kvm_vcpu *vcpu);
 void vcpu_load(struct kvm_vcpu *vcpu);
 void vcpu_put(struct kvm_vcpu *vcpu);
 
-int kvm_init(void *opaque, unsigned int vcpu_size,
+int kvm_init(void *opaque, unsigned vcpu_size, unsigned vcpu_align,
 		  struct module *module);
 void kvm_exit(void);
 
@@ -472,6 +475,7 @@ void kvm_free_irq_source_id(struct kvm *kvm, int irq_source_id);
 
 #ifdef CONFIG_IOMMU_API
 int kvm_iommu_map_pages(struct kvm *kvm, struct kvm_memory_slot *slot);
+void kvm_iommu_unmap_pages(struct kvm *kvm, struct kvm_memory_slot *slot);
 int kvm_iommu_map_guest(struct kvm *kvm);
 int kvm_iommu_unmap_guest(struct kvm *kvm);
 int kvm_assign_device(struct kvm *kvm,
@@ -484,6 +488,11 @@ static inline int kvm_iommu_map_pages(struct kvm *kvm,
 				      unsigned long npages)
 {
 	return 0;
+}
+
+static inline void kvm_iommu_unmap_pages(struct kvm *kvm,
+					 struct kvm_memory_slot *slot)
+{
 }
 
 static inline int kvm_iommu_map_guest(struct kvm *kvm)
@@ -635,5 +644,12 @@ static inline bool kvm_vcpu_is_bsp(struct kvm_vcpu *vcpu)
 {
 	return vcpu->kvm->bsp_vcpu_id == vcpu->vcpu_id;
 }
+
+bool kvm_vcpu_compatible(struct kvm_vcpu *vcpu);
+
+#else
+
+static bool kvm_vcpu_compatible(struct kvm_vcpu *vcpu) { return true; }
+
 #endif
 #endif

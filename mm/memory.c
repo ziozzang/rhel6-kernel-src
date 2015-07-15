@@ -953,7 +953,14 @@ static inline unsigned long zap_pmd_range(struct mmu_gather *tlb,
 			}
 			/* fall through */
 		}
-		if (pmd_none_or_clear_bad(pmd)) {
+		/*
+		 * Here there can be other concurrent MADV_DONTNEED or
+		 * trans huge page faults running, and if the pmd is
+		 * none or trans huge it can change under us. This is
+		 * because MADV_DONTNEED holds the mmap_sem in read
+		 * mode.
+		 */
+		if (pmd_none_or_trans_huge_or_clear_bad(pmd)) {
 			(*zap_work)--;
 			continue;
 		}
@@ -998,6 +1005,7 @@ static unsigned long unmap_page_range(struct mmu_gather *tlb,
 		details = NULL;
 
 	BUG_ON(addr >= end);
+	mem_cgroup_uncharge_start();
 	tlb_start_vma(tlb, vma);
 	pgd = pgd_offset(vma->vm_mm, addr);
 	do {
@@ -1010,6 +1018,7 @@ static unsigned long unmap_page_range(struct mmu_gather *tlb,
 						zap_work, details);
 	} while (pgd++, addr = next, (addr != end && *zap_work > 0));
 	tlb_end_vma(tlb, vma);
+	mem_cgroup_uncharge_end();
 
 	return addr;
 }

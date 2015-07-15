@@ -166,6 +166,7 @@ svc_pool_map_alloc_arrays(struct svc_pool_map *m, unsigned int maxpools)
 
 fail_free:
 	kfree(m->to_pool);
+	m->to_pool = NULL;
 fail:
 	return -ENOMEM;
 }
@@ -286,7 +287,9 @@ svc_pool_map_put(void)
 	if (!--m->count) {
 		m->mode = SVC_POOL_DEFAULT;
 		kfree(m->to_pool);
+		m->to_pool = NULL;
 		kfree(m->pool_to);
+		m->pool_to = NULL;
 		m->npools = 0;
 	}
 
@@ -353,6 +356,42 @@ svc_pool_for_cpu(struct svc_serv *serv, int cpu)
 	return &serv->sv_pools[pidx % serv->sv_nrpools];
 }
 
+static int svc_rpcb_setup(struct svc_serv *serv)
+{
+	int err;
+
+	err = rpcb_create_local();
+	if (err)
+		return err;
+
+	/* Remove any stale portmap registrations */
+	svc_unregister(serv);
+	return 0;
+}
+
+void svc_rpcb_cleanup(struct svc_serv *serv)
+{
+	svc_unregister(serv);
+	rpcb_put_local();
+}
+EXPORT_SYMBOL_GPL(svc_rpcb_cleanup);
+
+static int svc_uses_rpcbind(struct svc_serv *serv)
+{
+	struct svc_program	*progp;
+	unsigned int		i;
+
+	for (progp = serv->sv_program; progp; progp = progp->pg_next) {
+		for (i = 0; i < progp->pg_nvers; i++) {
+			if (progp->pg_vers[i] == NULL)
+				continue;
+			if (progp->pg_vers[i]->vs_hidden == 0)
+				return 1;
+		}
+	}
+
+	return 0;
+}
 
 /*
  * Create an RPC service
@@ -418,8 +457,15 @@ __svc_create(struct svc_program *prog, unsigned int bufsize, int npools,
 		spin_lock_init(&pool->sp_lock);
 	}
 
-	/* Remove any stale portmap registrations */
-	svc_unregister(serv);
+	if (svc_uses_rpcbind(serv)) {
+	       	if (svc_rpcb_setup(serv) < 0) {
+			kfree(serv->sv_pools);
+			kfree(serv);
+			return NULL;
+		}
+		if (!serv->sv_shutdown)
+			serv->sv_shutdown = svc_rpcb_cleanup;
+	}
 
 	return serv;
 }
@@ -471,23 +517,25 @@ svc_destroy(struct svc_serv *serv)
 		printk("svc_destroy: no threads for serv=%p!\n", serv);
 
 	del_timer_sync(&serv->sv_temptimer);
-
-	svc_close_all(&serv->sv_tempsocks);
+	/*
+	 * The set of xprts (contained in the sv_tempsocks and
+	 * sv_permsocks lists) is now constant, since it is modified
+	 * only by accepting new sockets (done by service threads in
+	 * svc_recv) or aging old ones (done by sv_temptimer), or
+	 * configuration changes (excluded by whatever locking the
+	 * caller is using--nfsd_mutex in the case of nfsd).  So it's
+	 * safe to traverse those lists and shut everything down:
+	 */
+	svc_close_all(serv);
 
 	if (serv->sv_shutdown)
 		serv->sv_shutdown(serv);
-
-	svc_close_all(&serv->sv_permsocks);
-
-	BUG_ON(!list_empty(&serv->sv_permsocks));
-	BUG_ON(!list_empty(&serv->sv_tempsocks));
 
 	cache_clean_deferred(serv);
 
 	if (svc_serv_is_pooled(serv))
 		svc_pool_map_put();
 
-	svc_unregister(serv);
 	kfree(serv->sv_pools);
 	kfree(serv);
 }
@@ -941,6 +989,8 @@ static void svc_unregister(const struct svc_serv *serv)
 			if (progp->pg_vers[i]->vs_hidden)
 				continue;
 
+			dprintk("svc: attempting to unregister %sv%u\n",
+				progp->pg_name, i);
 			__svc_unregister(progp->pg_prog, i, progp->pg_name);
 		}
 	}

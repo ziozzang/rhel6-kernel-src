@@ -235,7 +235,7 @@ cifs_new_fileinfo(__u16 fileHandle, struct file *file,
 	mutex_init(&pCifsFile->fh_mutex);
 	mutex_init(&pCifsFile->lock_mutex);
 	INIT_LIST_HEAD(&pCifsFile->llist);
-	slow_work_init(&pCifsFile->oplock_break, &cifs_oplock_break_ops);
+	vslow_work_init(&pCifsFile->oplock_break, &cifs_oplock_break_ops);
 
 	spin_lock(&cifs_file_list_lock);
 	list_add(&pCifsFile->tlist, &(tlink_tcon(tlink)->openFileList));
@@ -426,12 +426,17 @@ int cifs_open(struct inode *inode, struct file *file)
 		goto out;
 	}
 
-	if (tcon->ses->capabilities & CAP_NT_SMBS)
+	if (tcon->ses->capabilities & CAP_NT_SMBS) {
+		int create_options = CREATE_NOT_DIR;
+
+		if (backup_cred(cifs_sb))
+			create_options |= CREATE_OPEN_BACKUP_INTENT;
+
 		rc = CIFSSMBOpen(xid, tcon, full_path, disposition,
-			 desiredAccess, CREATE_NOT_DIR, &netfid, &oplock, buf,
+			 desiredAccess, create_options, &netfid, &oplock, buf,
 			 cifs_sb->local_nls, cifs_sb->mnt_cifs_flags
 				 & CIFS_MOUNT_MAP_SPECIAL_CHR);
-	else
+	} else
 		rc = -EIO; /* no NT SMB support fall into legacy open below */
 
 	if (rc == -EIO) {
@@ -509,6 +514,7 @@ static int cifs_reopen_file(struct cifsFileInfo *pCifsFile, bool can_flush)
 	char *full_path = NULL;
 	int desiredAccess;
 	int disposition = FILE_OPEN;
+	int create_options = CREATE_NOT_DIR;
 	__u16 netfid;
 
 	xid = GetXid();
@@ -568,6 +574,9 @@ static int cifs_reopen_file(struct cifsFileInfo *pCifsFile, bool can_flush)
 
 	desiredAccess = cifs_convert_flags(pCifsFile->f_flags);
 
+	if (backup_cred(cifs_sb))
+		create_options |= CREATE_OPEN_BACKUP_INTENT;
+
 	/* Can not refresh inode by passing in file_info buf to be returned
 	   by SMBOpen and then calling get_inode_info with returned buf
 	   since file might have write behind data that needs to be flushed
@@ -575,7 +584,7 @@ static int cifs_reopen_file(struct cifsFileInfo *pCifsFile, bool can_flush)
 	   that inode was not dirty locally we could do this */
 
 	rc = CIFSSMBOpen(xid, tcon, full_path, disposition, desiredAccess,
-			 CREATE_NOT_DIR, &netfid, &oplock, NULL,
+			 create_options, &netfid, &oplock, NULL,
 			 cifs_sb->local_nls, cifs_sb->mnt_cifs_flags &
 				CIFS_MOUNT_MAP_SPECIAL_CHR);
 	if (rc) {

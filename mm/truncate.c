@@ -224,6 +224,7 @@ void truncate_inode_pages_range(struct address_space *mapping,
 	next = start;
 	while (next <= end &&
 	       pagevec_lookup(&pvec, mapping, next, PAGEVEC_SIZE)) {
+		mem_cgroup_uncharge_start();
 		for (i = 0; i < pagevec_count(&pvec); i++) {
 			struct page *page = pvec.pages[i];
 			pgoff_t page_index = page->index;
@@ -246,6 +247,7 @@ void truncate_inode_pages_range(struct address_space *mapping,
 			unlock_page(page);
 		}
 		pagevec_release(&pvec);
+		mem_cgroup_uncharge_end();
 		cond_resched();
 	}
 
@@ -272,6 +274,7 @@ void truncate_inode_pages_range(struct address_space *mapping,
 			pagevec_release(&pvec);
 			break;
 		}
+		mem_cgroup_uncharge_start();
 		for (i = 0; i < pagevec_count(&pvec); i++) {
 			struct page *page = pvec.pages[i];
 
@@ -286,6 +289,7 @@ void truncate_inode_pages_range(struct address_space *mapping,
 			unlock_page(page);
 		}
 		pagevec_release(&pvec);
+		mem_cgroup_uncharge_end();
 	}
 }
 EXPORT_SYMBOL(truncate_inode_pages_range);
@@ -296,6 +300,11 @@ EXPORT_SYMBOL(truncate_inode_pages_range);
  * @lstart: offset from which to truncate
  *
  * Called under (and serialised by) inode->i_mutex.
+ *
+ * Note: When this function returns, there can be a page in the process of
+ * deletion (inside __delete_from_page_cache()) in the specified range.  Thus
+ * mapping->nrpages can be non-zero when this function returns even after
+ * truncation of the whole mapping.
  */
 void truncate_inode_pages(struct address_space *mapping, loff_t lstart)
 {
@@ -327,6 +336,7 @@ unsigned long invalidate_mapping_pages(struct address_space *mapping,
 	pagevec_init(&pvec, 0);
 	while (next <= end &&
 			pagevec_lookup(&pvec, mapping, next, PAGEVEC_SIZE)) {
+		mem_cgroup_uncharge_start();
 		for (i = 0; i < pagevec_count(&pvec); i++) {
 			struct page *page = pvec.pages[i];
 			pgoff_t index;
@@ -354,6 +364,7 @@ unsigned long invalidate_mapping_pages(struct address_space *mapping,
 				break;
 		}
 		pagevec_release(&pvec);
+		mem_cgroup_uncharge_end();
 		cond_resched();
 	}
 	return ret;
@@ -438,6 +449,7 @@ int invalidate_inode_pages2_range(struct address_space *mapping,
 	while (next <= end && !wrapped &&
 		pagevec_lookup(&pvec, mapping, next,
 			min(end - next, (pgoff_t)PAGEVEC_SIZE - 1) + 1)) {
+		mem_cgroup_uncharge_start();
 		for (i = 0; i < pagevec_count(&pvec); i++) {
 			struct page *page = pvec.pages[i];
 			pgoff_t page_index;
@@ -487,6 +499,7 @@ int invalidate_inode_pages2_range(struct address_space *mapping,
 			unlock_page(page);
 		}
 		pagevec_release(&pvec);
+		mem_cgroup_uncharge_end();
 		cond_resched();
 	}
 	return ret;
