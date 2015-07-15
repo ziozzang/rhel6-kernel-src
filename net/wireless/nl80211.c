@@ -2995,12 +2995,12 @@ static int nl80211_trigger_scan(struct sk_buff *skb, struct genl_info *info)
 	i = 0;
 	if (info->attrs[NL80211_ATTR_SCAN_SSIDS]) {
 		nla_for_each_nested(attr, info->attrs[NL80211_ATTR_SCAN_SSIDS], tmp) {
-			if (request->ssids[i].ssid_len > IEEE80211_MAX_SSID_LEN) {
+			if (nla_len(attr) > IEEE80211_MAX_SSID_LEN) {
 				err = -EINVAL;
 				goto out_free;
 			}
-			memcpy(request->ssids[i].ssid, nla_data(attr), nla_len(attr));
 			request->ssids[i].ssid_len = nla_len(attr);
+			memcpy(request->ssids[i].ssid, nla_data(attr), nla_len(attr));
 			i++;
 		}
 	}
@@ -3378,6 +3378,7 @@ static int nl80211_associate(struct sk_buff *skb, struct genl_info *info)
 {
 	struct cfg80211_registered_device *rdev;
 	struct net_device *dev;
+	struct wireless_dev *wdev;
 	struct cfg80211_crypto_settings crypto;
 	struct ieee80211_channel *chan, *fixedchan;
 	const u8 *bssid, *ssid, *ie = NULL, *prev_bssid = NULL;
@@ -3423,7 +3424,8 @@ static int nl80211_associate(struct sk_buff *skb, struct genl_info *info)
 	}
 
 	mutex_lock(&rdev->devlist_mtx);
-	fixedchan = rdev_fixed_channel(rdev, NULL);
+	wdev = dev->ieee80211_ptr;
+	fixedchan = rdev_fixed_channel(rdev, wdev);
 	if (fixedchan && chan != fixedchan) {
 		err = -EBUSY;
 		mutex_unlock(&rdev->devlist_mtx);

@@ -34,6 +34,7 @@
 #include <linux/swap.h>
 #include <linux/ksm.h>
 #include <linux/freezer.h>
+#include <linux/oom.h>
 
 #include <asm/tlbflush.h>
 #include "internal.h"
@@ -831,7 +832,9 @@ static int replace_page(struct vm_area_struct *vma, struct page *page,
 	set_pte_at_notify(mm, addr, ptep, mk_pte(kpage, vma->vm_page_prot));
 
 	page_remove_rmap(page);
-	free_page_and_swap_cache(page);
+	if (!page_mapped(page))
+		try_to_free_swap(page);
+	put_page(page);
 
 	pte_unmap_unlock(ptep, ptl);
 	err = 0;
@@ -907,18 +910,7 @@ static int try_to_merge_one_page(struct vm_area_struct *vma,
 	 * ptes are necessarily already write-protected.  But in either
 	 * case, we need to lock and check page_count is not raised.
 	 */
-	err = write_protect_page(vma, page, &orig_pte);
-
-	/*
-	 * After this mapping is wrprotected we don't need further
-	 * checks for PageSwapCache vs page_count unlock_page(page)
-	 * and we rely only on the pte_same() check run under PT lock
-	 * to ensure the pte didn't change since when we wrprotected
-	 * it under PG_lock.
-	 */
-	unlock_page(page);
-
-	if (!err) {
+	if (write_protect_page(vma, page, &orig_pte) == 0) {
 		if (!kpage) {
 			/*
 			 * While we hold page lock, upgrade page from
@@ -927,22 +919,22 @@ static int try_to_merge_one_page(struct vm_area_struct *vma,
 			 */
 			set_page_stable_node(page, NULL);
 			mark_page_accessed(page);
+			err = 0;
 		} else if (pages_identical(page, kpage))
 			err = replace_page(vma, page, kpage, orig_pte);
-	} else
-		err = -EFAULT;
+	}
 
 	if ((vma->vm_flags & VM_LOCKED) && kpage && !err) {
-		lock_page(page);	/* for LRU manipulation */
 		munlock_vma_page(page);
-		unlock_page(page);
 		if (!PageMlocked(kpage)) {
+			unlock_page(page);
 			lock_page(kpage);
 			mlock_vma_page(kpage);
-			unlock_page(kpage);
+			page = kpage;		/* for final unlock */
 		}
 	}
 
+	unlock_page(page);
 out:
 	return err;
 }
@@ -1337,6 +1329,9 @@ static struct rmap_item *scan_get_next_rmap_item(struct page **page)
 		slot = list_entry(slot->mm_list.next, struct mm_slot, mm_list);
 		ksm_scan.mm_slot = slot;
 		spin_unlock(&ksm_mmlist_lock);
+		/* We raced against exit of last slot on the list */
+		if (slot == &ksm_mm_head)
+			return NULL;
 next_mm:
 		ksm_scan.address = 0;
 		ksm_scan.rmap_list = &slot->rmap_list;
@@ -1925,9 +1920,11 @@ static ssize_t run_store(struct kobject *kobj, struct kobj_attribute *attr,
 	if (ksm_run != flags) {
 		ksm_run = flags;
 		if (flags & KSM_RUN_UNMERGE) {
-			current->flags |= PF_OOM_ORIGIN;
+			int oom_score_adj;
+
+			oom_score_adj = test_set_oom_score_adj(OOM_SCORE_ADJ_MAX);
 			err = unmerge_and_remove_all_rmap_items();
-			current->flags &= ~PF_OOM_ORIGIN;
+			test_set_oom_score_adj(oom_score_adj);
 			if (err) {
 				ksm_run = KSM_RUN_STOP;
 				count = err;

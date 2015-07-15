@@ -198,7 +198,7 @@ struct ctlr_info
  * CCISS_BOARD_READY_ITERATIONS are derived from those.
  */
 #define CCISS_BOARD_READY_WAIT_SECS (120)
-#define CCISS_BOARD_NOT_READY_WAIT_SECS (10)
+#define CCISS_BOARD_NOT_READY_WAIT_SECS (100)
 #define CCISS_BOARD_READY_POLL_INTERVAL_MSECS (100)
 #define CCISS_BOARD_READY_POLL_INTERVAL \
 	((CCISS_BOARD_READY_POLL_INTERVAL_MSECS * HZ) / 1000)
@@ -209,7 +209,9 @@ struct ctlr_info
 	((CCISS_BOARD_NOT_READY_WAIT_SECS * 1000) / \
 		CCISS_BOARD_READY_POLL_INTERVAL_MSECS)
 #define CCISS_POST_RESET_PAUSE_MSECS (3000)
+#define CCISS_POST_RESET_NOOP_INTERVAL_MSECS (4000)
 #define CCISS_POST_RESET_NOOP_RETRIES (12)
+#define CCISS_POST_RESET_NOOP_TIMEOUT_MSECS (10000)
 
 /* 
 	Send the command to the hardware 
@@ -221,7 +223,7 @@ static void SA5_submit_command( ctlr_info_t *h, CommandList_struct *c)
 			h->ctlr, c->busaddr);
 #endif /* CCISS_DEBUG */ 
 	writel(c->busaddr, h->vaddr + SA5_REQUEST_PORT_OFFSET);
-	readl(h->vaddr + SA5_REQUEST_PORT_OFFSET);
+	readl(h->vaddr + SA5_SCRATCHPAD_OFFSET);
 	h->commands_outstanding++;
 	if (h->commands_outstanding > h->max_outstanding)
 		h->max_outstanding = h->commands_outstanding;
