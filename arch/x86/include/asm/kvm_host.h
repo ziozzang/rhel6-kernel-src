@@ -43,7 +43,7 @@
 #define KVM_GUEST_CR0_MASK						\
 	(KVM_GUEST_CR0_MASK_UNRESTRICTED_GUEST | X86_CR0_PG | X86_CR0_PE)
 #define KVM_VM_CR0_ALWAYS_ON_UNRESTRICTED_GUEST				\
-	(X86_CR0_WP | X86_CR0_NE | X86_CR0_TS | X86_CR0_MP)
+	(X86_CR0_WP | X86_CR0_NE | X86_CR0_MP)
 #define KVM_VM_CR0_ALWAYS_ON						\
 	(KVM_VM_CR0_ALWAYS_ON_UNRESTRICTED_GUEST | X86_CR0_PG | X86_CR0_PE)
 #define KVM_GUEST_CR4_MASK						\
@@ -90,7 +90,7 @@
 #define KVM_NUM_MMU_PAGES (1 << KVM_MMU_HASH_SHIFT)
 #define KVM_MIN_FREE_MMU_PAGES 5
 #define KVM_REFILL_PAGES 25
-#define KVM_MAX_CPUID_ENTRIES 40
+#define KVM_MAX_CPUID_ENTRIES 80
 #define KVM_NR_FIXED_MTRR_REGION 88
 #define KVM_NR_VAR_MTRR 8
 
@@ -274,7 +274,6 @@ struct kvm_mmu {
 };
 
 struct kvm_vcpu_arch {
-	u64 host_tsc;
 	/*
 	 * rip and regs accesses must go through
 	 * kvm_{register,rip}_{read,write} functions.
@@ -284,6 +283,7 @@ struct kvm_vcpu_arch {
 	u32 regs_dirty;
 
 	unsigned long cr0;
+	unsigned long cr0_guest_owned_bits;
 	unsigned long cr2;
 	unsigned long cr3;
 	unsigned long cr4;
@@ -320,7 +320,6 @@ struct kvm_vcpu_arch {
 		unsigned long mmu_seq;
 	} update_pte;
 
-	struct i387_fxsave_struct host_fx_image;
 	struct i387_fxsave_struct guest_fx_image;
 
 	gva_t mmio_fault_cr2;
@@ -352,9 +351,16 @@ struct kvm_vcpu_arch {
 
 	gpa_t time;
 	struct pvclock_vcpu_time_info hv_clock;
-	unsigned int hv_clock_tsc_khz;
+	unsigned int hw_tsc_khz;
 	unsigned int time_offset;
 	struct page *time_page;
+	u64 last_host_tsc;
+	u64 last_guest_tsc;
+	u64 last_kernel_ns;
+	u64 last_tsc_nsec;
+	u64 last_tsc_write;
+	u64 tsc_offset_adjustment;
+	bool tsc_catchup;
 
 	bool singlestep; /* guest is single stepped by KVM */
 	bool nmi_pending;
@@ -393,9 +399,9 @@ struct kvm_mem_aliases {
 struct kvm_arch {
 	struct kvm_mem_aliases *aliases;
 
-	unsigned int n_free_mmu_pages;
+	unsigned int n_used_mmu_pages;
 	unsigned int n_requested_mmu_pages;
-	unsigned int n_alloc_mmu_pages;
+	unsigned int n_max_mmu_pages;
 	struct hlist_head mmu_page_hash[KVM_NUM_MMU_PAGES];
 	/*
 	 * Hash table of struct kvm_mmu_page.
@@ -419,8 +425,14 @@ struct kvm_arch {
 	gpa_t ept_identity_map_addr;
 
 	unsigned long irq_sources_bitmap;
-	u64 vm_init_tsc;
 	s64 kvmclock_offset;
+	spinlock_t tsc_write_lock;
+	u64 last_tsc_nsec;
+	u64 last_tsc_offset;
+	u64 last_tsc_write;
+	u32 virtual_tsc_khz;
+	u32 virtual_tsc_mult;
+	s8 virtual_tsc_shift;
 };
 
 struct kvm_vm_stat {
@@ -470,7 +482,7 @@ struct descriptor_table {
 struct kvm_x86_ops {
 	int (*cpu_has_kvm_support)(void);          /* __init */
 	int (*disabled_by_bios)(void);             /* __init */
-	void (*hardware_enable)(void *dummy);      /* __init */
+	int (*hardware_enable)(void *dummy);
 	void (*hardware_disable)(void *dummy);
 	void (*check_processor_compatibility)(void *rtn);
 	int (*hardware_setup)(void);               /* __init */
@@ -497,6 +509,7 @@ struct kvm_x86_ops {
 	void (*set_segment)(struct kvm_vcpu *vcpu,
 			    struct kvm_segment *var, int seg);
 	void (*get_cs_db_l_bits)(struct kvm_vcpu *vcpu, int *db, int *l);
+	void (*decache_cr0_guest_bits)(struct kvm_vcpu *vcpu);
 	void (*decache_cr4_guest_bits)(struct kvm_vcpu *vcpu);
 	void (*set_cr0)(struct kvm_vcpu *vcpu, unsigned long cr0);
 	void (*set_cr3)(struct kvm_vcpu *vcpu, unsigned long cr3);
@@ -512,6 +525,7 @@ struct kvm_x86_ops {
 	void (*cache_reg)(struct kvm_vcpu *vcpu, enum kvm_reg reg);
 	unsigned long (*get_rflags)(struct kvm_vcpu *vcpu);
 	void (*set_rflags)(struct kvm_vcpu *vcpu, unsigned long rflags);
+	void (*fpu_deactivate)(struct kvm_vcpu *vcpu);
 
 	void (*tlb_flush)(struct kvm_vcpu *vcpu);
 
@@ -537,6 +551,9 @@ struct kvm_x86_ops {
 	int (*get_tdp_level)(void);
 	u64 (*get_mt_mask)(struct kvm_vcpu *vcpu, gfn_t gfn, bool is_mmio);
 	bool (*gb_page_enable)(void);
+
+	void (*write_tsc_offset)(struct kvm_vcpu *vcpu, u64 offset);
+	void (*adjust_tsc_offset)(struct kvm_vcpu *vcpu, s64 adjustment);
 
 	const struct trace_print_flags *exit_reasons_str;
 };
@@ -613,7 +630,8 @@ int emulator_set_dr(struct x86_emulate_ctxt *ctxt, int dr,
 void kvm_get_segment(struct kvm_vcpu *vcpu, struct kvm_segment *var, int seg);
 int kvm_load_segment_descriptor(struct kvm_vcpu *vcpu, u16 selector, int seg);
 
-int kvm_task_switch(struct kvm_vcpu *vcpu, u16 tss_selector, int reason);
+int kvm_task_switch(struct kvm_vcpu *vcpu, u16 tss_selector, int reason,
+		    bool has_error_code, u32 error_code);
 
 int kvm_set_cr0(struct kvm_vcpu *vcpu, unsigned long cr0);
 int kvm_set_cr3(struct kvm_vcpu *vcpu, unsigned long cr3);
@@ -682,35 +700,11 @@ static inline struct kvm_mmu_page *page_header(hpa_t shadow_page)
 	return (struct kvm_mmu_page *)page_private(page);
 }
 
-static inline u16 kvm_read_fs(void)
-{
-	u16 seg;
-	asm("mov %%fs, %0" : "=g"(seg));
-	return seg;
-}
-
-static inline u16 kvm_read_gs(void)
-{
-	u16 seg;
-	asm("mov %%gs, %0" : "=g"(seg));
-	return seg;
-}
-
 static inline u16 kvm_read_ldt(void)
 {
 	u16 ldt;
 	asm("sldt %0" : "=g"(ldt));
 	return ldt;
-}
-
-static inline void kvm_load_fs(u16 sel)
-{
-	asm("mov %0, %%fs" : : "rm"(sel));
-}
-
-static inline void kvm_load_gs(u16 sel)
-{
-	asm("mov %0, %%gs" : : "rm"(sel));
 }
 
 static inline void kvm_load_ldt(u16 sel)

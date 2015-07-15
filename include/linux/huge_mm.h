@@ -47,10 +47,11 @@ extern pmd_t *page_check_address_pmd(struct page *page,
 #define HPAGE_PMD_SIZE HPAGE_SIZE
 
 #define transparent_hugepage_enabled(__vma)				\
-	(transparent_hugepage_flags & (1<<TRANSPARENT_HUGEPAGE_FLAG) ||	\
-	 (transparent_hugepage_flags &					\
-	  (1<<TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG) &&			\
-	  (__vma)->vm_flags & VM_HUGEPAGE))
+	((transparent_hugepage_flags & (1<<TRANSPARENT_HUGEPAGE_FLAG) || \
+	  (transparent_hugepage_flags &					\
+	   (1<<TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG) &&			\
+	   (__vma)->vm_flags & VM_HUGEPAGE)) &&				\
+	 !is_vma_temporary_stack(__vma))
 #define transparent_hugepage_defrag(__vma)				\
 	((transparent_hugepage_flags &					\
 	  (1<<TRANSPARENT_HUGEPAGE_DEFRAG_FLAG)) ||			\
@@ -100,6 +101,19 @@ extern void __split_huge_page_pmd(struct mm_struct *mm, pmd_t *pmd);
 #endif
 
 extern unsigned long vma_address(struct page *page, struct vm_area_struct *vma);
+extern void __vma_adjust_trans_huge(struct vm_area_struct *vma,
+				    unsigned long start,
+				    unsigned long end,
+				    long adjust_next);
+static inline void vma_adjust_trans_huge(struct vm_area_struct *vma,
+					 unsigned long start,
+					 unsigned long end,
+					 long adjust_next)
+{
+	if (!vma->anon_vma || vma->vm_ops || vma->vm_file)
+		return;
+	__vma_adjust_trans_huge(vma, start, end, adjust_next);
+}
 static inline int PageTransHuge(struct page *page)
 {
 	VM_BUG_ON(PageTail(page));
@@ -114,6 +128,23 @@ static inline int hpage_nr_pages(struct page *page)
 	if (unlikely(PageTransHuge(page)))
 		return HPAGE_PMD_NR;
 	return 1;
+}
+static inline struct page *compound_trans_head(struct page *page)
+{
+	if (PageTail(page)) {
+		struct page *head;
+		head = page->first_page;
+		smp_rmb();
+		/*
+		 * head may be a dangling pointer.
+		 * __split_huge_page_refcount clears PageTail before
+		 * overwriting first_page, so if PageTail is still
+		 * there it means the head pointer isn't dangling.
+		 */
+		if (PageTail(page))
+			return head;
+	}
+	return page;
 }
 #else /* CONFIG_TRANSPARENT_HUGEPAGE */
 #define HPAGE_PMD_SHIFT ({ BUG(); 0; })
@@ -133,8 +164,15 @@ static inline int split_huge_page(struct page *page)
 	do { } while (0)
 #define wait_split_huge_page(__anon_vma, __pmd)	\
 	do { } while (0)
+#define compound_trans_head(page) compound_head(page)
 #define PageTransHuge(page) 0
 #define PageTransCompound(page) 0
+static inline void vma_adjust_trans_huge(struct vm_area_struct *vma,
+					 unsigned long start,
+					 unsigned long end,
+					 long adjust_next)
+{
+}
 #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
 
 #endif /* _LINUX_HUGE_MM_H */

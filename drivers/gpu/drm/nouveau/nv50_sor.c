@@ -66,36 +66,6 @@ nv50_sor_disconnect(struct drm_encoder *encoder)
 }
 
 static void
-nv50_sor_dp_link_train(struct drm_encoder *encoder)
-{
-	struct drm_device *dev = encoder->dev;
-	struct nouveau_encoder *nv_encoder = nouveau_encoder(encoder);
-	struct bit_displayport_encoder_table *dpe;
-	int dpe_headerlen;
-
-	dpe = nouveau_bios_dp_table(dev, nv_encoder->dcb, &dpe_headerlen);
-	if (!dpe) {
-		NV_ERROR(dev, "SOR-%d: no DP encoder table!\n", nv_encoder->or);
-		return;
-	}
-
-	if (dpe->script0) {
-		NV_DEBUG_KMS(dev, "SOR-%d: running DP script 0\n", nv_encoder->or);
-		nouveau_bios_run_init_table(dev, le16_to_cpu(dpe->script0),
-					    nv_encoder->dcb);
-	}
-
-	if (!nouveau_dp_link_train(encoder))
-		NV_ERROR(dev, "SOR-%d: link training failed\n", nv_encoder->or);
-
-	if (dpe->script1) {
-		NV_DEBUG_KMS(dev, "SOR-%d: running DP script 1\n", nv_encoder->or);
-		nouveau_bios_run_init_table(dev, le16_to_cpu(dpe->script1),
-					    nv_encoder->dcb);
-	}
-}
-
-static void
 nv50_sor_dpms(struct drm_encoder *encoder, int mode)
 {
 	struct drm_device *dev = encoder->dev;
@@ -122,7 +92,7 @@ nv50_sor_dpms(struct drm_encoder *encoder, int mode)
 	}
 
 	/* wait for it to be done */
-	if (!nv_wait(NV50_PDISPLAY_SOR_DPMS_CTRL(or),
+	if (!nv_wait(dev, NV50_PDISPLAY_SOR_DPMS_CTRL(or),
 		     NV50_PDISPLAY_SOR_DPMS_CTRL_PENDING, 0)) {
 		NV_ERROR(dev, "timeout: SOR_DPMS_CTRL_PENDING(%d) == 0\n", or);
 		NV_ERROR(dev, "SOR_DPMS_CTRL(%d) = 0x%08x\n", or,
@@ -138,15 +108,29 @@ nv50_sor_dpms(struct drm_encoder *encoder, int mode)
 
 	nv_wr32(dev, NV50_PDISPLAY_SOR_DPMS_CTRL(or), val |
 		NV50_PDISPLAY_SOR_DPMS_CTRL_PENDING);
-	if (!nv_wait(NV50_PDISPLAY_SOR_DPMS_STATE(or),
+	if (!nv_wait(dev, NV50_PDISPLAY_SOR_DPMS_STATE(or),
 		     NV50_PDISPLAY_SOR_DPMS_STATE_WAIT, 0)) {
 		NV_ERROR(dev, "timeout: SOR_DPMS_STATE_WAIT(%d) == 0\n", or);
 		NV_ERROR(dev, "SOR_DPMS_STATE(%d) = 0x%08x\n", or,
 			 nv_rd32(dev, NV50_PDISPLAY_SOR_DPMS_STATE(or)));
 	}
 
-	if (nv_encoder->dcb->type == OUTPUT_DP && mode == DRM_MODE_DPMS_ON)
-		nv50_sor_dp_link_train(encoder);
+	if (nv_encoder->dcb->type == OUTPUT_DP) {
+		struct nouveau_i2c_chan *auxch;
+
+		auxch = nouveau_i2c_find(dev, nv_encoder->dcb->i2c_index);
+		if (!auxch)
+			return;
+
+		if (mode == DRM_MODE_DPMS_ON) {
+			u8 status = DP_SET_POWER_D0;
+			nouveau_dp_auxch(auxch, 8, DP_SET_POWER, &status, 1);
+			nouveau_dp_link_train(encoder);
+		} else {
+			u8 status = DP_SET_POWER_D3;
+			nouveau_dp_auxch(auxch, 8, DP_SET_POWER, &status, 1);
+		}
+	}
 }
 
 static void

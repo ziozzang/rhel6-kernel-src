@@ -46,6 +46,7 @@ struct r100_cs_track_texture {
 	unsigned		height_11;
 	bool			use_pitch;
 	bool			enabled;
+	bool                    lookup_disable;
 	bool			roundup_w;
 	bool			roundup_h;
 	unsigned                compress_format;
@@ -64,6 +65,7 @@ struct r100_cs_track {
 	unsigned			maxy;
 	unsigned			vtx_size;
 	unsigned			vap_vf_cntl;
+	unsigned			vap_alt_nverts;
 	unsigned			immd_dwords;
 	unsigned			num_arrays;
 	unsigned			max_indx;
@@ -71,11 +73,14 @@ struct r100_cs_track {
 	struct r100_cs_track_array	arrays[11];
 	struct r100_cs_track_cb 	cb[R300_MAX_CB];
 	struct r100_cs_track_cb 	zb;
+	struct r100_cs_track_cb 	aa;
 	struct r100_cs_track_texture	textures[R300_TRACK_MAX_TEXTURE];
 	bool				z_enabled;
 	bool                            separate_cube;
-	bool				fastfill;
+	bool				zb_cb_clear;
 	bool				blend_read_enable;
+	bool				aa_dirty;
+	bool				aaresolve;
 };
 
 int r100_cs_track_check(struct radeon_device *rdev, struct r100_cs_track *track);

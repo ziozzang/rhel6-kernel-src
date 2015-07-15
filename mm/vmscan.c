@@ -40,6 +40,7 @@
 #include <linux/memcontrol.h>
 #include <linux/delayacct.h>
 #include <linux/sysctl.h>
+#include <linux/compaction.h>
 #include <trace/events/kmem.h>
 
 #include <asm/tlbflush.h>
@@ -419,6 +420,8 @@ static pageout_t pageout(struct page *page, struct address_space *mapping,
  */
 static int __remove_mapping(struct address_space *mapping, struct page *page)
 {
+	struct inode *inode = mapping->host;
+
 	BUG_ON(!PageLocked(page));
 	BUG_ON(mapping != page_mapping(page));
 
@@ -462,9 +465,17 @@ static int __remove_mapping(struct address_space *mapping, struct page *page)
 		spin_unlock_irq(&mapping->tree_lock);
 		swapcache_free(swap, page);
 	} else {
+		void (*freepage)(struct page *) = NULL;
+
+		if (IS_AOP_EXT(inode))
+			freepage = EXT_AOPS(mapping->a_ops)->freepage;
+
 		__remove_from_page_cache(page);
 		spin_unlock_irq(&mapping->tree_lock);
 		mem_cgroup_uncharge_cache_page(page);
+
+		if (freepage != NULL)
+			freepage(page);
 	}
 
 	return 1;
@@ -1762,6 +1773,7 @@ static unsigned long do_try_to_free_pages(struct zonelist *zonelist,
 	enum zone_type high_zoneidx = gfp_zone(sc->gfp_mask);
 	unsigned long writeback_threshold;
 
+	get_mems_allowed();
 	delayacct_freepages_start();
 
 	if (scanning_global_lru(sc))
@@ -1851,6 +1863,7 @@ out:
 		mem_cgroup_record_reclaim_priority(sc->mem_cgroup, priority);
 
 	delayacct_freepages_end();
+	put_mems_allowed();
 
 	return ret;
 }
@@ -1956,6 +1969,9 @@ static int sleeping_prematurely(pg_data_t *pgdat, int order, long remaining)
 		struct zone *zone = pgdat->node_zones + i;
 
 		if (!populated_zone(zone))
+			continue;
+
+		if (zone_is_all_unreclaimable(zone))
 			continue;
 
 		if (!zone_watermark_ok(zone, order, high_wmark_pages(zone),
@@ -2086,6 +2102,7 @@ loop_again:
 			struct zone *zone = pgdat->node_zones + i;
 			int nr_slab;
 			int nid, zid;
+			unsigned long balance_gap;
 
 			if (!populated_zone(zone))
 				continue;
@@ -2110,17 +2127,27 @@ loop_again:
 			mem_cgroup_soft_limit_reclaim(zone, order, sc.gfp_mask,
 							nid, zid);
 			/*
-			 * We put equal pressure on every zone, unless one
-			 * zone has way too many pages free already.
+			 * We put equal pressure on every zone, unless
+			 * one zone has way too many pages free
+			 * already. The "too many pages" is defined
+			 * as the high wmark plus a "gap" where the
+			 * gap is either the low watermark or 1%
+			 * of the zone, whichever is smaller.
 			 */
+			balance_gap = min(low_wmark_pages(zone),
+				(zone->present_pages +
+					KSWAPD_ZONE_BALANCE_GAP_RATIO-1) /
+				KSWAPD_ZONE_BALANCE_GAP_RATIO);
 			if (!zone_watermark_ok(zone, order,
-					8*high_wmark_pages(zone), end_zone, 0))
+					high_wmark_pages(zone) + balance_gap,
+					end_zone, 0))
 				shrink_zone(priority, zone, &sc);
 			reclaim_state->reclaimed_slab = 0;
 			nr_slab = shrink_slab(sc.nr_scanned, GFP_KERNEL,
 						lru_pages);
 			sc.nr_reclaimed += reclaim_state->reclaimed_slab;
 			total_scanned += sc.nr_scanned;
+
 			if (zone_is_all_unreclaimable(zone))
 				continue;
 			if (nr_slab == 0 && zone->pages_scanned >=
