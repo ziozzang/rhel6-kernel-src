@@ -2038,8 +2038,24 @@ void __init enable_IO_APIC(void)
 /*
  * Not an __init, needed by the reboot code
  */
-void disable_IO_APIC(void)
+void disable_IO_APIC(int force)
 {
+	/*
+	 * Use force to bust the io_apic spinlock
+	 *
+	 * There is a case where kdump can race with irq
+	 * migration such that kdump will inject an NMI
+	 * while another cpu holds the ioapic_lock to
+	 * migrate the irq.  This would cause a deadlock.
+	 *
+	 * Because kdump stops all the cpus, we can safely
+	 * bust the spinlock as we are just clearing the
+	 * io apic anyway.
+	 */
+	if (force && spin_is_locked(&ioapic_lock))
+		/* only one cpu should be running now */
+		spin_lock_init(&ioapic_lock);
+
 	/*
 	 * Clear the IO-APIC before rebooting:
 	 */
@@ -4249,18 +4265,17 @@ void __init ioapic_init_mappings(void)
 #ifdef CONFIG_X86_32
 fake_ioapic_page:
 #endif
-			ioapic_phys = (unsigned long)
-				alloc_bootmem_pages(PAGE_SIZE);
+			ioapic_phys = (unsigned long)alloc_bootmem_pages(PAGE_SIZE);
 			ioapic_phys = __pa(ioapic_phys);
 		}
 		set_fixmap_nocache(idx, ioapic_phys);
-		apic_printk(APIC_VERBOSE,
-			    "mapped IOAPIC to %08lx (%08lx)\n",
-			    __fix_to_virt(idx), ioapic_phys);
+		apic_printk(APIC_VERBOSE, "mapped IOAPIC to %08lx (%08lx)\n",
+			__fix_to_virt(idx) + (ioapic_phys & ~PAGE_MASK),
+			ioapic_phys);
 		idx++;
 
 		ioapic_res->start = ioapic_phys;
-		ioapic_res->end = ioapic_phys + (4 * 1024) - 1;
+		ioapic_res->end = ioapic_phys + IO_APIC_SLOT_SIZE - 1;
 		ioapic_res++;
 	}
 }

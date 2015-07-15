@@ -73,6 +73,8 @@ static int sctp_side_effects(sctp_event_t event_type, sctp_subtype_t subtype,
 			     sctp_cmd_seq_t *commands,
 			     gfp_t gfp);
 
+static void sctp_cmd_hb_timer_update(sctp_cmd_seq_t *cmds,
+				     struct sctp_transport *t);
 /********************************************************************
  * Helper functions
  ********************************************************************/
@@ -467,7 +469,8 @@ sctp_timer_event_t *sctp_timer_events[SCTP_NUM_TIMEOUT_TYPES] = {
  * notification SHOULD be sent to the upper layer.
  *
  */
-static void sctp_do_8_2_transport_strike(struct sctp_association *asoc,
+static void sctp_do_8_2_transport_strike(sctp_cmd_seq_t *commands,
+					 struct sctp_association *asoc,
 					 struct sctp_transport *transport,
 					 int is_hb)
 {
@@ -490,6 +493,23 @@ static void sctp_do_8_2_transport_strike(struct sctp_association *asoc,
 			asoc->overall_error_count++;
 		if (transport->state != SCTP_INACTIVE)
 			transport->error_count++;
+	}
+
+	/* If the transport error count is greater than the pf_retrans
+	 * threshold, and less than pathmaxrtx, then mark this transport
+	 * as Partially Failed, ee SCTP Quick Failover Draft, secon 5.1,
+	 * point 1
+	 */
+	if ((transport->state != SCTP_PF) &&
+	   (asoc->pf_retrans < transport->pathmaxrxt) &&
+	   (transport->error_count > asoc->pf_retrans)) {
+
+		sctp_assoc_control_transport(asoc, transport,
+					     SCTP_TRANSPORT_PF,
+					     0);
+
+		/* Update the hb timer to resend a heartbeat every rto */
+		sctp_cmd_hb_timer_update(commands, transport);
 	}
 
 	if (transport->state != SCTP_INACTIVE &&
@@ -550,7 +570,7 @@ static void sctp_cmd_assoc_failed(sctp_cmd_seq_t *commands,
 				  unsigned error)
 {
 	struct sctp_ulpevent *event;
-
+	struct sctp_chunk *abort;
 	/* Cancel any partial delivery in progress. */
 	sctp_ulpq_abort_pd(&asoc->ulpq, GFP_ATOMIC);
 
@@ -565,6 +585,13 @@ static void sctp_cmd_assoc_failed(sctp_cmd_seq_t *commands,
 	if (event)
 		sctp_add_cmd_sf(commands, SCTP_CMD_EVENT_ULP,
 				SCTP_ULPEVENT(event));
+
+	if (asoc->overall_error_count >= asoc->max_retrans) {
+		abort = sctp_make_violation_max_retrans(asoc, chunk);
+		if (abort)
+			sctp_add_cmd_sf(commands, SCTP_CMD_REPLY,
+					SCTP_CHUNK(abort));
+	}
 
 	sctp_add_cmd_sf(commands, SCTP_CMD_NEW_STATE,
 			SCTP_STATE(SCTP_STATE_CLOSED));
@@ -690,6 +717,10 @@ static void sctp_cmd_transport_on(sctp_cmd_seq_t *cmds,
 	 * marked.
 	 */
 	if ((t->state == SCTP_INACTIVE) || (t->state == SCTP_UNCONFIRMED))
+		sctp_assoc_control_transport(asoc, t, SCTP_TRANSPORT_UP,
+					     SCTP_HEARTBEAT_SUCCESS);
+
+	if (t->state == SCTP_PF)
 		sctp_assoc_control_transport(asoc, t, SCTP_TRANSPORT_UP,
 					     SCTP_HEARTBEAT_SUCCESS);
 
@@ -1267,7 +1298,7 @@ static int sctp_cmd_interpreter(sctp_event_t event_type,
 		case SCTP_CMD_REPORT_TSN:
 			/* Record the arrival of a TSN.  */
 			error = sctp_tsnmap_mark(&asoc->peer.tsn_map,
-						 cmd->obj.u32);
+						 cmd->obj.u32, NULL);
 			break;
 
 		case SCTP_CMD_REPORT_FWDTSN:
@@ -1570,8 +1601,8 @@ static int sctp_cmd_interpreter(sctp_event_t event_type,
 
 		case SCTP_CMD_STRIKE:
 			/* Mark one strike against a transport.  */
-			sctp_do_8_2_transport_strike(asoc, cmd->obj.transport,
-						    0);
+			sctp_do_8_2_transport_strike(commands, asoc,
+						    cmd->obj.transport, 0);
 			break;
 
 		case SCTP_CMD_TRANSPORT_IDLE:
@@ -1581,7 +1612,8 @@ static int sctp_cmd_interpreter(sctp_event_t event_type,
 
 		case SCTP_CMD_TRANSPORT_HB_SENT:
 			t = cmd->obj.transport;
-			sctp_do_8_2_transport_strike(asoc, t, 1);
+			sctp_do_8_2_transport_strike(commands, asoc,
+						     t, 1);
 			t->hb_sent = 1;
 			break;
 

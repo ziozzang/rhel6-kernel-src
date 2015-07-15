@@ -102,6 +102,20 @@ int sysctl_max_map_count __read_mostly = DEFAULT_MAX_MAP_COUNT;
 struct percpu_counter vm_committed_as;
 
 /*
+ * The global memory commitment made in the system can be a metric
+ * that can be used to drive ballooning decisions when Linux is hosted
+ * as a guest. On Hyper-V, the host implements a policy engine for dynamically
+ * balancing memory across competing virtual machines that are hosted.
+ * Several metrics drive this policy engine including the guest reported
+ * memory commitment.
+ */
+unsigned long vm_memory_committed(void)
+{
+	return percpu_counter_read_positive(&vm_committed_as);
+}
+EXPORT_SYMBOL_GPL(vm_memory_committed);
+
+/*
  * Check that a process has enough memory to allocate a new virtual
  * mapping. 0 means there is enough memory for the allocation to
  * succeed and -ENOMEM implies there is not.
@@ -616,8 +630,12 @@ again:			remove_next = 1 + (end > next->vm_end);
 	 */
 	if (vma->anon_vma && (insert || importer || start != vma->vm_start)) {
 		anon_vma = vma->anon_vma;
+		VM_BUG_ON(adjust_next && next->anon_vma &&
+			  anon_vma != next->anon_vma);
+	} else if (adjust_next && next->anon_vma)
+		anon_vma = next->anon_vma;
+	if (anon_vma)
 		anon_vma_lock(anon_vma);
-	}
 
 	if (root) {
 		flush_dcache_mmap_lock(mapping);
@@ -1564,8 +1582,6 @@ static bool should_randomize(void)
 		!(current->personality & ADDR_NO_RANDOMIZE);
 }
 
-#define SHLIB_BASE	0x00110000
-
 unsigned long
 arch_get_unmapped_exec_area(struct file *filp, unsigned long addr0,
 		unsigned long len0, unsigned long pgoff, unsigned long flags)
@@ -1582,8 +1598,8 @@ arch_get_unmapped_exec_area(struct file *filp, unsigned long addr0,
 		return addr;
 
 	if (!addr)
-		addr = !should_randomize() ? SHLIB_BASE :
-			randomize_range(SHLIB_BASE, 0x01000000, len);
+		addr = !should_randomize() ? mm->shlib_base :
+			randomize_range(mm->shlib_base, 0x01000000, len);
 
 	if (addr) {
 		addr = PAGE_ALIGN(addr);
@@ -1593,7 +1609,7 @@ arch_get_unmapped_exec_area(struct file *filp, unsigned long addr0,
 			return addr;
 	}
 
-	addr = SHLIB_BASE;
+	addr = mm->shlib_base;
 	for (vma = find_vma(mm, addr); ; vma = vma->vm_next) {
 		/* At this point:  (!vma || addr < vma->vm_end). */
 		if (TASK_SIZE - len < addr)

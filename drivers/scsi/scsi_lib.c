@@ -102,7 +102,7 @@ static void scsi_unprep_request(struct request *req)
  * for a requeue after completion, which should only occur in this
  * file.
  */
-static int __scsi_queue_insert(struct scsi_cmnd *cmd, int reason, int unbusy)
+static void __scsi_queue_insert(struct scsi_cmnd *cmd, int reason, int unbusy)
 {
 	struct Scsi_Host *host = cmd->device->host;
 	struct scsi_device *device = cmd->device;
@@ -148,22 +148,14 @@ static int __scsi_queue_insert(struct scsi_cmnd *cmd, int reason, int unbusy)
 
 	/*
 	 * Requeue this command.  It will go before all other commands
-	 * that are already in the queue.
-	 *
-	 * NOTE: there is magic here about the way the queue is plugged if
-	 * we have no outstanding commands.
-	 * 
-	 * Although we *don't* plug the queue, we call the request
-	 * function.  The SCSI request function detects the blocked condition
-	 * and plugs the queue appropriately.
+	 * that are already in the queue. Schedule requeue work under
+	 * lock such that the kblockd_schedule_work() call happens
+	 * before blk_cleanup_queue() finishes.
          */
 	spin_lock_irqsave(q->queue_lock, flags);
 	blk_requeue_request(q, cmd->request);
-	spin_unlock_irqrestore(q->queue_lock, flags);
-
 	kblockd_schedule_work(q, &device->requeue_work);
-
-	return 0;
+	spin_unlock_irqrestore(q->queue_lock, flags);
 }
 
 /*
@@ -185,9 +177,9 @@ static int __scsi_queue_insert(struct scsi_cmnd *cmd, int reason, int unbusy)
  * Notes:       This could be called either from an interrupt context or a
  *              normal process context.
  */
-int scsi_queue_insert(struct scsi_cmnd *cmd, int reason)
+void scsi_queue_insert(struct scsi_cmnd *cmd, int reason)
 {
-	return __scsi_queue_insert(cmd, reason, 1);
+	__scsi_queue_insert(cmd, reason, 1);
 }
 /**
  * scsi_execute - insert request and wait for the result
@@ -406,7 +398,6 @@ static void scsi_run_queue(struct request_queue *q)
 	LIST_HEAD(starved_list);
 	unsigned long flags;
 
-	BUG_ON(!sdev);
 	shost = sdev->host;
 	if (scsi_target(sdev)->single_lun)
 		scsi_single_lun_run(sdev);
@@ -480,8 +471,17 @@ void scsi_requeue_run_queue(struct work_struct *work)
  */
 static void scsi_requeue_command(struct request_queue *q, struct scsi_cmnd *cmd)
 {
+	struct scsi_device *sdev = cmd->device;
 	struct request *req = cmd->request;
 	unsigned long flags;
+
+	/*
+	 * We need to hold a reference on the device to avoid the queue being
+	 * killed after the unlock and before scsi_run_queue is invoked which
+	 * may happen because scsi_unprep_request() puts the command which
+	 * releases its reference on the device.
+	 */
+	get_device(&sdev->sdev_gendev);
 
 	spin_lock_irqsave(q->queue_lock, flags);
 	scsi_unprep_request(req);
@@ -489,6 +489,8 @@ static void scsi_requeue_command(struct request_queue *q, struct scsi_cmnd *cmd)
 	spin_unlock_irqrestore(q->queue_lock, flags);
 
 	scsi_run_queue(q);
+
+	put_device(&sdev->sdev_gendev);
 }
 
 void scsi_next_command(struct scsi_cmnd *cmd)
@@ -1173,6 +1175,7 @@ int scsi_prep_state_check(struct scsi_device *sdev, struct request *req)
 	if (unlikely(sdev->sdev_state != SDEV_RUNNING)) {
 		switch (sdev->sdev_state) {
 		case SDEV_OFFLINE:
+		case SDEV_TRANSPORT_OFFLINE:
 			/*
 			 * If the device is offline we refuse to process any
 			 * commands.  The device must be brought online
@@ -1383,17 +1386,19 @@ static int scsi_lld_busy(struct request_queue *q)
 {
 	struct scsi_device *sdev = q->queuedata;
 	struct Scsi_Host *shost;
-	struct scsi_target *starget;
 
 	if (blk_queue_dead(q))
 		return 0;
 
-	BUG_ON(!sdev);
 	shost = sdev->host;
-	starget = scsi_target(sdev);
 
-	if (scsi_host_in_recovery(shost) || scsi_host_is_busy(shost) ||
-	    scsi_target_is_busy(starget) || scsi_device_is_busy(sdev))
+	/*
+	 * Ignore host/starget busy state.
+	 * Since block layer does not have a concept of fairness across
+	 * multiple queues, congestion of host/starget needs to be handled
+	 * in SCSI layer.
+	 */
+	if (scsi_host_in_recovery(shost) || scsi_device_is_busy(sdev))
 		return 1;
 
 	return 0;
@@ -1500,8 +1505,6 @@ static void scsi_request_fn(struct request_queue *q)
 	struct Scsi_Host *shost;
 	struct scsi_cmnd *cmd;
 	struct request *req;
-
-	BUG_ON(!sdev);
 
 	if(!get_device(&sdev->sdev_gendev))
 		/* We must be tearing the block queue down already */
@@ -2072,7 +2075,7 @@ scsi_device_set_state(struct scsi_device *sdev, enum scsi_device_state state)
 	if (state == oldstate)
 		return 0;
 
-	switch (state) {
+	switch ((int) state) {
 	case SDEV_CREATED:
 		switch (oldstate) {
 		case SDEV_CREATED_BLOCK:
@@ -2086,6 +2089,7 @@ scsi_device_set_state(struct scsi_device *sdev, enum scsi_device_state state)
 		switch (oldstate) {
 		case SDEV_CREATED:
 		case SDEV_OFFLINE:
+		case SDEV_TRANSPORT_OFFLINE:
 		case SDEV_QUIESCE:
 		case SDEV_BLOCK:
 			break;
@@ -2098,6 +2102,7 @@ scsi_device_set_state(struct scsi_device *sdev, enum scsi_device_state state)
 		switch (oldstate) {
 		case SDEV_RUNNING:
 		case SDEV_OFFLINE:
+		case SDEV_TRANSPORT_OFFLINE:
 			break;
 		default:
 			goto illegal;
@@ -2105,6 +2110,7 @@ scsi_device_set_state(struct scsi_device *sdev, enum scsi_device_state state)
 		break;
 
 	case SDEV_OFFLINE:
+	case SDEV_TRANSPORT_OFFLINE:
 		switch (oldstate) {
 		case SDEV_CREATED:
 		case SDEV_RUNNING:
@@ -2141,6 +2147,7 @@ scsi_device_set_state(struct scsi_device *sdev, enum scsi_device_state state)
 		case SDEV_RUNNING:
 		case SDEV_QUIESCE:
 		case SDEV_OFFLINE:
+		case SDEV_TRANSPORT_OFFLINE:
 		case SDEV_BLOCK:
 			break;
 		default:
@@ -2153,6 +2160,7 @@ scsi_device_set_state(struct scsi_device *sdev, enum scsi_device_state state)
 		case SDEV_CREATED:
 		case SDEV_RUNNING:
 		case SDEV_OFFLINE:
+		case SDEV_TRANSPORT_OFFLINE:
 		case SDEV_CANCEL:
 			break;
 		default:
@@ -2356,10 +2364,14 @@ EXPORT_SYMBOL(scsi_device_quiesce);
  *
  *	Must be called with user context, may sleep.
  */
-void
-scsi_device_resume(struct scsi_device *sdev)
+void scsi_device_resume(struct scsi_device *sdev)
 {
-	if(scsi_device_set_state(sdev, SDEV_RUNNING))
+	/* check if the device state was mutated prior to resume, and if
+	 * so assume the state is being managed elsewhere (for example
+	 * device deleted during suspend)
+	 */
+	if (sdev->sdev_state != SDEV_QUIESCE ||
+	    scsi_device_set_state(sdev, SDEV_RUNNING))
 		return;
 	scsi_run_queue(sdev->request_queue);
 }
@@ -2439,6 +2451,7 @@ EXPORT_SYMBOL_GPL(scsi_internal_device_block);
 /**
  * scsi_internal_device_unblock - resume a device after a block request
  * @sdev:	device to resume
+ * @new_state:	state to set devices to after unblocking
  *
  * Called by scsi lld's or the midlayer to restart the device queue
  * for the previously suspended scsi device.  Called from interrupt or
@@ -2448,33 +2461,46 @@ EXPORT_SYMBOL_GPL(scsi_internal_device_block);
  *
  * Notes:       
  *	This routine transitions the device to the SDEV_RUNNING state
- *	(which must be a legal transition) allowing the midlayer to
- *	goose the queue for this device.  This routine assumes the 
- *	host_lock is held upon entry.
+ *	or to one of the offline states (which must be a legal transition)
+ *	allowing the midlayer to goose the queue for this device. This
+ *	routine assumes the host_lock is held upon entry.
  */
 int
-scsi_internal_device_unblock(struct scsi_device *sdev)
+__scsi_internal_device_unblock(struct scsi_device *sdev,
+			     enum scsi_device_state new_state)
 {
 	struct request_queue *q = sdev->request_queue; 
 	unsigned long flags;
-	int err;
 
-	/* 
-	 * Try to transition the scsi device to SDEV_RUNNING
-	 * and goose the device queue if successful.  
+	/*
+	 * Try to transition the scsi device to SDEV_RUNNING or one of the
+	 * offlined states and goose the device queue if successful.
 	 */
-	err = scsi_device_set_state(sdev, SDEV_RUNNING);
-	if (err) {
-		err = scsi_device_set_state(sdev, SDEV_CREATED);
-		if (err)
-			return err;
-	}
+	if ((sdev->sdev_state == SDEV_BLOCK) ||
+	    (sdev->sdev_state == SDEV_TRANSPORT_OFFLINE))
+		sdev->sdev_state = new_state;
+	else if (sdev->sdev_state == SDEV_CREATED_BLOCK) {
+		if (new_state == SDEV_TRANSPORT_OFFLINE ||
+		    new_state == SDEV_OFFLINE)
+			sdev->sdev_state = new_state;
+		else
+			sdev->sdev_state = SDEV_CREATED;
+	} else if (sdev->sdev_state != SDEV_CANCEL &&
+		 sdev->sdev_state != SDEV_OFFLINE)
+		return -EINVAL;
 
 	spin_lock_irqsave(q->queue_lock, flags);
 	blk_start_queue(q);
 	spin_unlock_irqrestore(q->queue_lock, flags);
 
 	return 0;
+}
+EXPORT_SYMBOL_GPL(__scsi_internal_device_unblock);
+
+int
+scsi_internal_device_unblock(struct scsi_device *sdev)
+{
+	return __scsi_internal_device_unblock(sdev, SDEV_RUNNING);
 }
 EXPORT_SYMBOL_GPL(scsi_internal_device_unblock);
 
@@ -2507,26 +2533,33 @@ EXPORT_SYMBOL_GPL(scsi_target_block);
 static void
 device_unblock(struct scsi_device *sdev, void *data)
 {
-	scsi_internal_device_unblock(sdev);
+	__scsi_internal_device_unblock(sdev, *(enum scsi_device_state *)data);
 }
 
 static int
 target_unblock(struct device *dev, void *data)
 {
 	if (scsi_is_target_device(dev))
-		starget_for_each_device(to_scsi_target(dev), NULL,
+		starget_for_each_device(to_scsi_target(dev), data,
 					device_unblock);
 	return 0;
 }
 
 void
-scsi_target_unblock(struct device *dev)
+__scsi_target_unblock(struct device *dev, enum scsi_device_state new_state)
 {
 	if (scsi_is_target_device(dev))
-		starget_for_each_device(to_scsi_target(dev), NULL,
+		starget_for_each_device(to_scsi_target(dev), &new_state,
 					device_unblock);
 	else
-		device_for_each_child(dev, NULL, target_unblock);
+		device_for_each_child(dev, &new_state, target_unblock);
+}
+EXPORT_SYMBOL_GPL(__scsi_target_unblock);
+
+void
+scsi_target_unblock(struct device *dev)
+{
+	__scsi_target_unblock(dev, SDEV_RUNNING);
 }
 EXPORT_SYMBOL_GPL(scsi_target_unblock);
 

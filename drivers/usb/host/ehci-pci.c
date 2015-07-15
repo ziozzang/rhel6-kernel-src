@@ -123,7 +123,13 @@ static int ehci_pci_setup(struct usb_hcd *hcd)
 
 	switch (pdev->vendor) {
 	case PCI_VENDOR_ID_INTEL:
-		ehci->need_io_watchdog = 0;
+		if (io_watchdog_force) {
+			ehci_info(ehci, "Forcing IO watchdog ON for INTEL hardware\n");
+			ehci->need_io_watchdog = 1;
+		}
+		else 
+			ehci->need_io_watchdog = 0;
+
 		if (pdev->device == 0x27cc) {
 			ehci->broken_periodic = 1;
 			ehci_info(ehci, "using broken periodic workaround\n");
@@ -349,7 +355,9 @@ static bool usb_is_intel_switchable_ehci(struct pci_dev *pdev)
 {
 	return pdev->class == PCI_CLASS_SERIAL_USB_EHCI &&
 		pdev->vendor == PCI_VENDOR_ID_INTEL &&
-		pdev->device == 0x1E26;
+		(pdev->device == 0x1E26 ||
+		 pdev->device == 0x8C2D ||
+		 pdev->device == 0x8C26);
 }
 
 static void ehci_enable_xhci_companion(void)

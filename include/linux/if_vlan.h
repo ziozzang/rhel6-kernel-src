@@ -95,6 +95,14 @@ struct vlan_group *vlan_group_alloc(struct net_device *real_dev);
 void vlan_group_free(struct vlan_group *grp);
 int vlan_group_prealloc_vid(struct vlan_group *vg, u16 vlan_id);
 
+#ifdef CONFIG_VLAN_8021Q_GVRP
+extern int vlan_gvrp_init_applicant(struct net_device *dev);
+extern void vlan_gvrp_uninit_applicant(struct net_device *dev);
+#else
+static inline int vlan_gvrp_init_applicant(struct net_device *dev) { return 0; }
+static inline void vlan_gvrp_uninit_applicant(struct net_device *dev) {}
+#endif
+
 static inline struct net_device *vlan_group_get_device(struct vlan_group *vg,
 						       u16 vlan_id)
 {
@@ -368,6 +376,40 @@ static inline __be16 vlan_get_protocol(const struct sk_buff *skb)
 	}
 
 	return protocol;
+}
+
+static inline void vlan_set_encap_proto(struct sk_buff *skb,
+					struct vlan_hdr *vhdr)
+{
+	__be16 proto;
+	unsigned char *rawp;
+
+	/*
+	 * Was a VLAN packet, grab the encapsulated protocol, which the layer
+	 * three protocols care about.
+	 */
+
+	proto = vhdr->h_vlan_encapsulated_proto;
+	if (ntohs(proto) >= 1536) {
+		skb->protocol = proto;
+		return;
+	}
+
+	rawp = skb->data;
+	if (*(unsigned short *) rawp == 0xFFFF)
+		/*
+		 * This is a magic hack to spot IPX packets. Older Novell
+		 * breaks the protocol design and runs IPX over 802.3 without
+		 * an 802.2 LLC layer. We look for FFFF which isn't a used
+		 * 802.2 SSAP/DSAP. This won't work for fault tolerant netware
+		 * but does for the rest.
+		 */
+		skb->protocol = htons(ETH_P_802_3);
+	else
+		/*
+		 * Real 802.2 LLC
+		 */
+		skb->protocol = htons(ETH_P_802_2);
 }
 #endif /* __KERNEL__ */
 

@@ -342,6 +342,13 @@ struct usb_bus {
 	u8 otg_port;			/* 0, or number of OTG/HNP port */
 	unsigned is_b_host:1;		/* true during some HNP roleswitches */
 	unsigned b_hnp_enable:1;	/* OTG: did A-Host enable HNP? */
+#ifndef __GENKSYMS__
+	unsigned no_stop_on_short:1;    /*
+					 * Quirk: some controllers don't stop
+					 * the ep queue on a short transfer
+					 * with the URB_SHORT_NOT_OK flag set.
+					 */
+#endif
 	unsigned sg_tablesize;		/* 0 or largest number of sg list entries */
 
 	int devnum_next;		/* Next open device number in
@@ -617,6 +624,17 @@ static inline void usb_autopm_disable(struct usb_interface *intf)
 static inline void usb_mark_last_busy(struct usb_device *udev)
 { }
 #endif
+
+extern int usb_disable_ltm(struct usb_device *udev);
+extern void usb_enable_ltm(struct usb_device *udev);
+
+static inline bool usb_device_supports_ltm(struct usb_device *udev)
+{
+	if (udev->speed != USB_SPEED_SUPER || !udev->bos || !udev->bos->ss_cap)
+		return false;
+	return udev->bos->ss_cap->bmAttributes & USB_LTM_SUPPORT;
+}
+
 
 /*-------------------------------------------------------------------------*/
 
@@ -992,6 +1010,18 @@ static inline int usb_register(struct usb_driver *driver)
 	return usb_register_driver(driver, THIS_MODULE, KBUILD_MODNAME);
 }
 extern void usb_deregister(struct usb_driver *);
+
+/**
+ * module_usb_driver() - Helper macro for registering a USB driver
+ * @__usb_driver: usb_driver struct
+ *
+ * Helper macro for USB drivers which do not do anything special in module
+ * init/exit. This eliminates a lot of boilerplate. Each module may only
+ * use this macro once, and calling it replaces module_init() and module_exit()
+ */
+#define module_usb_driver(__usb_driver) \
+	module_driver(__usb_driver, usb_register, \
+		       usb_deregister)
 
 extern int usb_register_device_driver(struct usb_device_driver *,
 			struct module *);

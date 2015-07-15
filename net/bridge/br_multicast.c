@@ -596,12 +596,11 @@ static struct net_bridge_mdb_entry *br_multicast_get_group(
 
 	if (mdb->size >= max) {
 		max *= 2;
-		if (unlikely(max >= br->hash_max)) {
-			printk(KERN_WARNING "%s: Multicast hash table maximum "
-			       "reached, disabling snooping: %s, %d\n",
-			       br->dev->name, port ? port->dev->name :
-						     br->dev->name,
-			       max);
+		if (unlikely(max > br->hash_max)) {
+			printk(KERN_WARNING "%s: Multicast hash table maximum of %d "
+				"reached, disabling snooping: %s\n",
+				br->dev->name, br->hash_max,
+				port ? port->dev->name : br->dev->name);
 			err = -E2BIG;
 disable:
 			br->multicast_disabled = 1;
@@ -1164,7 +1163,7 @@ static int br_ip4_multicast_query(struct net_bridge *br,
 		if (timer_pending(&p->timer) ?
 		    time_after(p->timer.expires, now + max_delay) :
 		    try_to_del_timer_sync(&p->timer) >= 0)
-			mod_timer(&mp->timer, now + max_delay);
+			mod_timer(&p->timer, now + max_delay);
 	}
 
 out:
@@ -1232,7 +1231,7 @@ static int br_ip6_multicast_query(struct net_bridge *br,
 		if (timer_pending(&p->timer) ?
 		    time_after(p->timer.expires, now + max_delay) :
 		    try_to_del_timer_sync(&p->timer) >= 0)
-			mod_timer(&mp->timer, now + max_delay);
+			mod_timer(&p->timer, now + max_delay);
 	}
 
 out:

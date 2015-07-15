@@ -245,6 +245,11 @@ static sctp_xmit_t sctp_packet_bundle_sack(struct sctp_packet *pkt,
 		/* If the SACK timer is running, we have a pending SACK */
 		if (timer_pending(timer)) {
 			struct sctp_chunk *sack;
+
+			if (pkt->transport->sack_generation !=
+			    pkt->transport->asoc->peer.sack_generation)
+				return retval;
+
 			asoc->a_rwnd = asoc->rwnd;
 			sack = sctp_make_sack(asoc);
 			if (sack) {
@@ -331,6 +336,25 @@ finish:
 	return retval;
 }
 
+static void sctp_packet_release_owner(struct sk_buff *skb)
+{
+	sk_free(skb->sk);
+}
+
+static void sctp_packet_set_owner_w(struct sk_buff *skb, struct sock *sk)
+{
+	skb_orphan(skb);
+	skb->sk = sk;
+	skb->destructor = sctp_packet_release_owner;
+
+	/*
+	 * The data chunks have already been accounted for in sctp_sendmsg(),
+	 * therefore only reserve a single byte to keep socket around until
+	 * the packet has been transmitted.
+	 */
+	atomic_inc(&sk->sk_wmem_alloc);
+}
+
 /* All packets are sent to the network through this function from
  * sctp_outq_tail().
  *
@@ -372,7 +396,7 @@ int sctp_packet_transmit(struct sctp_packet *packet)
 	/* Set the owning socket so that we know where to get the
 	 * destination IP address.
 	 */
-	skb_set_owner_w(nskb, sk);
+	sctp_packet_set_owner_w(nskb, sk);
 
 	/* The 'obsolete' field of dst is set to 2 when a dst is freed. */
 	if (!dst || (dst->obsolete > 1)) {

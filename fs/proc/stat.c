@@ -19,21 +19,41 @@
 #ifndef arch_irq_stat
 #define arch_irq_stat() 0
 #endif
-#ifndef arch_idle_time
-#define arch_idle_time(cpu) 0
-#endif
+
+#ifdef arch_idle_time
+
+static cputime64_t get_idle_time(int cpu)
+{
+	cputime64_t idle;
+
+	idle = kstat_cpu(cpu).cpustat.idle;
+	if (cpu_online(cpu) && !nr_iowait_cpu(cpu))
+		idle += arch_idle_time(cpu);
+	return idle;
+}
+
+static cputime64_t get_iowait_time(int cpu)
+{
+	cputime64_t iowait;
+
+	iowait = kstat_cpu(cpu).cpustat.iowait;
+	if (cpu_online(cpu) && nr_iowait_cpu(cpu))
+		iowait += arch_idle_time(cpu);
+	return iowait;
+}
+
+#else
 
 static cputime64_t get_idle_time(int cpu)
 {
 	u64 idle_time = get_cpu_idle_time_us(cpu, NULL);
 	cputime64_t idle;
 
-	if (idle_time == -1ULL) {
+	if (idle_time == -1ULL)
 		/* !NO_HZ so we can rely on cpustat.idle */
 		idle = kstat_cpu(cpu).cpustat.idle;
-		idle = cputime64_add(idle, arch_idle_time(cpu));
-	} else
-		idle = nsecs_to_jiffies(1000 * idle_time);
+	else
+		idle = usecs_to_cputime64(idle_time);
 
 	return idle;
 }
@@ -47,10 +67,12 @@ static cputime64_t get_iowait_time(int cpu)
 		/* !NO_HZ so we can rely on cpustat.iowait */
 		iowait = kstat_cpu(cpu).cpustat.iowait;
 	else
-		iowait = nsecs_to_jiffies(1000 * iowait_time);
+		iowait = usecs_to_cputime64(iowait_time);
 
 	return iowait;
 }
+
+#endif
 
 static int show_stat(struct seq_file *p, void *v)
 {

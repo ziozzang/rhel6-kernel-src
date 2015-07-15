@@ -746,7 +746,9 @@ void rpc_execute(struct rpc_task *task)
 
 static void rpc_async_schedule(struct work_struct *work)
 {
+	current->flags |= PF_FSTRANS;
 	__rpc_execute(container_of(work, struct rpc_task, u.tk_work));
+	current->flags &= ~PF_FSTRANS;
 }
 
 /**
@@ -896,8 +898,10 @@ static void rpc_release_resources_task(struct rpc_task *task)
 {
 	if (task->tk_rqstp)
 		xprt_release(task);
-	if (task->tk_msg.rpc_cred)
+	if (task->tk_msg.rpc_cred) {
 		put_rpccred(task->tk_msg.rpc_cred);
+		task->tk_msg.rpc_cred = NULL;
+	}
 	rpc_task_release_client(task);
 }
 

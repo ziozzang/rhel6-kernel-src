@@ -8,9 +8,9 @@
  *
  * Each stripe contains one buffer per device.  Each buffer can be in
  * one of a number of states stored in "flags".  Changes between
- * these states happen *almost* exclusively under the protection of the
- * STRIPE_ACTIVE flag.  Some very specific changes can happen in bi_end_io, and
- * these are not protected by STRIPE_ACTIVE.
+ * these states happen *almost* exclusively under a per-stripe
+ * spinlock.  Some very specific changes can happen in bi_end_io, and
+ * these are not protected by the spin lock.
  *
  * The flag bits that are used to represent these states are:
  *   R5_UPTODATE and R5_LOCKED
@@ -27,7 +27,7 @@
  * The possible state transitions are:
  *
  *  Empty -> Want   - on read or write to get old data for  parity calc
- *  Empty -> Dirty  - on compute_parity to satisfy write/sync request.(RECONSTRUCT_WRITE)
+ *  Empty -> Dirty  - on compute_parity to satisfy write/sync request.
  *  Empty -> Clean  - on compute_block when computing a block for failed drive
  *  Want  -> Empty  - on failed read
  *  Want  -> Clean  - on successful completion of read request
@@ -94,6 +94,7 @@
  *
  * The inactive_list, handle_list and hash bucket lists are all protected by the
  * device_lock.
+ *  - stripes on the inactive_list never have their stripe_lock held.
  *  - stripes have a reference counter. If count==0, they are on a list.
  *  - If a stripe might need handling, STRIPE_HANDLE is set.
  *  - When refcount reaches zero, then if STRIPE_HANDLE it is put on
@@ -113,10 +114,10 @@
  *  attach a request to an active stripe (add_stripe_bh())
  *     lockdev attach-buffer unlockdev
  *  handle a stripe (handle_stripe())
- *     setSTRIPE_ACTIVE,  clrSTRIPE_HANDLE ...
+ *     lockstripe clrSTRIPE_HANDLE ...
  *		(lockdev check-buffers unlockdev) ..
  *		change-state ..
- *		record io/ops needed clearSTRIPE_ACTIVE schedule io/ops
+ *		record io/ops needed unlockstripe schedule io/ops
  *  release an active stripe (release_stripe())
  *     lockdev if (!--cnt) { if  STRIPE_HANDLE, add to handle_list else add to inactive-list } unlockdev
  *
@@ -125,7 +126,8 @@
  * on a cached buffer, and plus one if the stripe is undergoing stripe
  * operations.
  *
- * The stripe operations are:
+ * Stripe operations are performed outside the stripe lock,
+ * the stripe operations are:
  * -copying data between the stripe cache and user application buffers
  * -computing blocks to save a disk access, or to recover a missing block
  * -updating the parity on a write operation (reconstruct write and
@@ -206,6 +208,7 @@ struct stripe_head {
 	short			ddf_layout;/* use DDF ordering to calculate Q */
 	unsigned long		state;		/* state flags */
 	atomic_t		count;	      /* nr of active thread/requests */
+	spinlock_t		lock;
 	int			bm_seq;	/* sequence number for bitmap flushes */
 	int			disks;		/* disks in stripe */
 	enum check_states	check_state;
@@ -226,8 +229,11 @@ struct stripe_head {
 		#endif
 	} ops;
 	struct r5dev {
-		struct bio	req;
-		struct bio_vec	vec;
+		/* rreq and rvec are used for the replacement device when
+		 * writing data to both devices.
+		 */
+		struct bio	req, rreq;
+		struct bio_vec	vec, rvec;
 		struct page	*page;
 		struct bio	*toread, *read, *towrite, *written;
 		sector_t	sector;			/* sector of this page */
@@ -236,10 +242,16 @@ struct stripe_head {
 };
 
 /* stripe_head_state - collects and tracks the dynamic state of a stripe_head
- *     for handle_stripe.
+ *     for handle_stripe.  It is only valid under spin_lock(sh->lock);
  */
 struct stripe_head_state {
-	int syncing, expanding, expanded;
+	/* 'syncing' means that we need to read all devices, either
+	 * to check/correct parity, or to reconstruct a missing device.
+	 * 'replacing' means we are replacing one or more drives and
+	 * the source is valid at this point so we don't need to
+	 * read all devices, just the replacement targets.
+	 */
+	int syncing, expanding, expanded, replacing;
 	int locked, uptodate, to_read, to_write, failed, written;
 	int to_fill, compute, req_compute, non_overwrite;
 	int failed_num[2];
@@ -252,44 +264,47 @@ struct stripe_head_state {
 	int handle_bad_blocks;
 };
 
-/* Flags */
-#define	R5_UPTODATE	0	/* page contains current data */
-#define	R5_LOCKED	1	/* IO has been submitted on "req" */
-#define	R5_OVERWRITE	2	/* towrite covers whole page */
+/* Flags for struct r5dev.flags */
+enum r5dev_flags {
+	R5_UPTODATE,	/* page contains current data */
+	R5_LOCKED,	/* IO has been submitted on "req" */
+	R5_DOUBLE_LOCKED,/* Cannot clear R5_LOCKED until 2 writes complete */
+	R5_OVERWRITE,	/* towrite covers whole page */
 /* and some that are internal to handle_stripe */
-#define	R5_Insync	3	/* rdev && rdev->in_sync at start */
-#define	R5_Wantread	4	/* want to schedule a read */
-#define	R5_Wantwrite	5
-#define	R5_Overlap	7	/* There is a pending overlapping request on this block */
-#define	R5_ReadError	8	/* seen a read error here recently */
-#define	R5_ReWrite	9	/* have tried to over-write the readerror */
+	R5_Insync,	/* rdev && rdev->in_sync at start */
+	R5_Wantread,	/* want to schedule a read */
+	R5_Wantwrite,
+	R5_Overlap,	/* There is a pending overlapping request
+			 * on this block */
+	R5_ReadError,	/* seen a read error here recently */
+	R5_ReWrite,	/* have tried to over-write the readerror */
 
-#define	R5_Expanded	10	/* This block now has post-expand data */
-#define	R5_Wantcompute	11	/* compute_block in progress treat as
-				 * uptodate
-				 */
-#define	R5_Wantfill	12	/* dev->toread contains a bio that needs
-				 * filling
-				 */
-#define	R5_Wantdrain	13	/* dev->towrite needs to be drained */
-#define	R5_WantFUA	14	/* Write should be FUA */
-#define	R5_WriteError	15	/* got a write error - need to record it */
-#define	R5_MadeGood	16	/* A bad block has been fixed by writing to it*/
-/*
- * Write method
- */
-#define RECONSTRUCT_WRITE	1
-#define READ_MODIFY_WRITE	2
-/* not a write method, but a compute_parity mode */
-#define	CHECK_PARITY		3
-/* Additional compute_parity mode -- updates the parity w/o LOCKING */
-#define UPDATE_PARITY		4
+	R5_Expanded,	/* This block now has post-expand data */
+	R5_Wantcompute,	/* compute_block in progress treat as
+			 * uptodate
+			 */
+	R5_Wantfill,	/* dev->toread contains a bio that needs
+			 * filling
+			 */
+	R5_Wantdrain,	/* dev->towrite needs to be drained */
+	R5_WantFUA,	/* Write should be FUA */
+	R5_SyncIO,	/* The IO is sync */
+	R5_WriteError,	/* got a write error - need to record it */
+	R5_MadeGood,	/* A bad block has been fixed by writing to it */
+	R5_ReadRepl,	/* Will/did read from replacement rather than orig */
+	R5_MadeGoodRepl,/* A bad block on the replacement device has been
+			 * fixed by writing to it */
+	R5_NeedReplace,	/* This device has a replacement which is not
+			 * up-to-date at this stripe. */
+	R5_WantReplace, /* We need to update the replacement, we have read
+			 * data in, and now is a good time to write it out.
+			 */
+};
 
 /*
  * Stripe state
  */
 enum {
-	STRIPE_ACTIVE,
 	STRIPE_HANDLE,
 	STRIPE_SYNC_REQUESTED,
 	STRIPE_SYNCING,
@@ -311,13 +326,14 @@ enum {
 /*
  * Operation request flags
  */
-#define STRIPE_OP_BIOFILL	0
-#define STRIPE_OP_COMPUTE_BLK	1
-#define STRIPE_OP_PREXOR	2
-#define STRIPE_OP_BIODRAIN	3
-#define STRIPE_OP_RECONSTRUCT	4
-#define STRIPE_OP_CHECK	5
-
+enum {
+	STRIPE_OP_BIOFILL,
+	STRIPE_OP_COMPUTE_BLK,
+	STRIPE_OP_PREXOR,
+	STRIPE_OP_BIODRAIN,
+	STRIPE_OP_RECONSTRUCT,
+	STRIPE_OP_CHECK,
+};
 /*
  * Plugging:
  *
@@ -344,13 +360,12 @@ enum {
 
 
 struct disk_info {
-	struct md_rdev	*rdev;
+	struct md_rdev	*rdev, *replacement;
 };
 
 struct r5conf {
 	struct hlist_head	*stripe_hashtbl;
 	struct mddev		*mddev;
-	struct disk_info	*spare;
 	int			chunk_sectors;
 	int			level, algorithm;
 	int			max_degraded;
@@ -373,6 +388,12 @@ struct r5conf {
 	short			generation; /* increments with every reshape */
 	unsigned long		reshape_checkpoint; /* Time we last updated
 						     * metadata */
+	long long		min_offset_diff; /* minimum difference between
+						  * data_offset and
+						  * new_data_offset across all
+						  * devices.  May be negative,
+						  * but is closest to zero.
+						  */
 
 	struct list_head	handle_list; /* stripes needing handling */
 	struct list_head	hold_list; /* preread ready stripes */
