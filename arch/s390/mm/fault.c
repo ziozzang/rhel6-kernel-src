@@ -199,14 +199,21 @@ static noinline void do_sigbus(struct pt_regs *regs, long int_code,
 			       unsigned long trans_exc_code)
 {
 	struct task_struct *tsk = current;
+	unsigned long address;
+	struct siginfo si;
 
 	/*
 	 * Send a sigbus, regardless of whether we were in kernel
 	 * or user mode.
 	 */
-	tsk->thread.prot_addr = trans_exc_code & __FAIL_ADDR_MASK;
+	address = trans_exc_code & __FAIL_ADDR_MASK;
+	tsk->thread.prot_addr = address;
 	tsk->thread.trap_no = int_code;
-	force_sig(SIGBUS, tsk);
+	si.si_signo = SIGBUS;
+	si.si_errno = 0;
+	si.si_code = BUS_ADRERR;
+	si.si_addr = (void __user *) address;
+	force_sig_info(SIGBUS, &si, tsk);
 }
 
 #ifdef CONFIG_S390_EXEC_PROTECT
@@ -263,13 +270,18 @@ static noinline void do_fault_error(struct pt_regs *regs, long int_code,
 		do_no_context(regs, int_code, trans_exc_code);
 		break;
 	default: /* fault & VM_FAULT_ERROR */
-		if (fault & VM_FAULT_OOM)
-			pagefault_out_of_memory();
-		else if (fault & VM_FAULT_SIGBUS) {
-			do_sigbus(regs, int_code, trans_exc_code);
+		if (fault & VM_FAULT_OOM) {
 			/* Kernel mode? Handle exceptions or die */
 			if (!(regs->psw.mask & PSW_MASK_PSTATE))
 				do_no_context(regs, int_code, trans_exc_code);
+			else
+				pagefault_out_of_memory();
+		} else if (fault & VM_FAULT_SIGBUS) {
+			/* Kernel mode? Handle exceptions or die */
+			if (!(regs->psw.mask & PSW_MASK_PSTATE))
+				do_no_context(regs, int_code, trans_exc_code);
+			else
+				do_sigbus(regs, int_code, trans_exc_code);
 		} else
 			BUG();
 		break;
@@ -293,6 +305,7 @@ static inline int do_exception(struct pt_regs *regs, int access,
 	struct task_struct *tsk;
 	struct mm_struct *mm;
 	struct vm_area_struct *vma;
+	unsigned int flags = 0;
 	unsigned long address;
 	int fault;
 
@@ -310,6 +323,11 @@ static inline int do_exception(struct pt_regs *regs, int access,
 	fault = VM_FAULT_BADCONTEXT;
 	if (unlikely(!user_space_fault(trans_exc_code) || in_atomic() || !mm))
 		goto out;
+
+	flags |= FAULT_FLAG_USER;
+
+	if (access == VM_WRITE)
+		flags |= FAULT_FLAG_WRITE;
 
 	address = trans_exc_code & __FAIL_ADDR_MASK;
 	/*
@@ -348,8 +366,7 @@ static inline int do_exception(struct pt_regs *regs, int access,
 	 * make sure we exit gracefully rather than endlessly redo
 	 * the fault.
 	 */
-	fault = handle_mm_fault(mm, vma, address,
-				(access == VM_WRITE) ? FAULT_FLAG_WRITE : 0);
+	fault = handle_mm_fault(mm, vma, address, flags);
 	if (unlikely(fault & VM_FAULT_ERROR))
 		goto out_up;
 
