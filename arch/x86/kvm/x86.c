@@ -1003,7 +1003,7 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
 	unsigned long flags;
 	struct kvm_vcpu_arch *vcpu = &v->arch;
 	unsigned long this_tsc_khz;
-	s64 kernel_ns, max_kernel_ns;
+	s64 kernel_ns;
 	u64 tsc_timestamp;
 	struct pvclock_vcpu_time_info guest_hv_clock;
 	u8 pvclock_flags;
@@ -1045,46 +1045,12 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
 	if (!vcpu->pv_time_enabled)
 		return 0;
 
-	/*
-	 * Time as measured by the TSC may go backwards when resetting the base
-	 * tsc_timestamp.  The reason for this is that the TSC resolution is
-	 * higher than the resolution of the other clock scales.  Thus, many
-	 * possible measurments of the TSC correspond to one measurement of any
-	 * other clock, and so a spread of values is possible.  This is not a
-	 * problem for the computation of the nanosecond clock; with TSC rates
-	 * around 1GHZ, there can only be a few cycles which correspond to one
-	 * nanosecond value, and any path through this code will inevitably
-	 * take longer than that.  However, with the kernel_ns value itself,
-	 * the precision may be much lower, down to HZ granularity.  If the
-	 * first sampling of TSC against kernel_ns ends in the low part of the
-	 * range, and the second in the high end of the range, we can get:
-	 *
-	 * (TSC - offset_low) * S + kns_old > (TSC - offset_high) * S + kns_new
-	 *
-	 * As the sampling errors potentially range in the thousands of cycles,
-	 * it is possible such a time value has already been observed by the
-	 * guest.  To protect against this, we must compute the system time as
-	 * observed by the guest and ensure the new system time is greater.
-	 */
-	max_kernel_ns = 0;
-	if (vcpu->hv_clock.tsc_timestamp && vcpu->last_guest_tsc) {
-		max_kernel_ns = vcpu->last_guest_tsc -
-				vcpu->hv_clock.tsc_timestamp;
-		max_kernel_ns = pvclock_scale_delta(max_kernel_ns,
-				    vcpu->hv_clock.tsc_to_system_mul,
-				    vcpu->hv_clock.tsc_shift);
-		max_kernel_ns += vcpu->last_kernel_ns;
-	}
-
 	if (unlikely(vcpu->hw_tsc_khz != this_tsc_khz)) {
 		kvm_get_time_scale(NSEC_PER_SEC / 1000, this_tsc_khz,
 				   &vcpu->hv_clock.tsc_shift,
 				   &vcpu->hv_clock.tsc_to_system_mul);
 		vcpu->hw_tsc_khz = this_tsc_khz;
 	}
-
-	if (max_kernel_ns > kernel_ns)
-		kernel_ns = max_kernel_ns;
 
 	/* With all the info we got, fill in the values */
 	vcpu->hv_clock.tsc_timestamp = tsc_timestamp;
@@ -1141,20 +1107,50 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
  * the others.
  *
  * So in those cases, request a kvmclock update for all vcpus.
- * The worst case for a remote vcpu to update its kvmclock
- * is then bounded by maximum nohz sleep latency.
+ * We need to rate-limit these requests though, as they can
+ * considerably slow guests that have a large number of vcpus.
+ * The time for a remote vcpu to update its kvmclock is bound
+ * by the delay we use to rate-limit the updates.
  */
 
-static void kvm_gen_kvmclock_update(struct kvm_vcpu *v)
+#define KVMCLOCK_UPDATE_DELAY msecs_to_jiffies(100)
+
+static void kvmclock_update_fn(struct work_struct *work)
 {
 	int i;
-	struct kvm *kvm = v->kvm;
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct kvm_arch *ka = container_of(dwork, struct kvm_arch,
+					   kvmclock_update_work);
+	struct kvm *kvm = container_of(ka, struct kvm, arch);
 	struct kvm_vcpu *vcpu;
 
 	kvm_for_each_vcpu(i, vcpu, kvm) {
 		set_bit(KVM_REQ_CLOCK_UPDATE, &vcpu->requests);
 		kvm_vcpu_kick(vcpu);
 	}
+}
+
+static void kvm_gen_kvmclock_update(struct kvm_vcpu *v)
+{
+	struct kvm *kvm = v->kvm;
+
+	set_bit(KVM_REQ_CLOCK_UPDATE, &v->requests);
+	schedule_delayed_work(&kvm->arch.kvmclock_update_work,
+					KVMCLOCK_UPDATE_DELAY);
+}
+
+#define KVMCLOCK_SYNC_PERIOD (300 * HZ)
+
+static void kvmclock_sync_fn(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct kvm_arch *ka = container_of(dwork, struct kvm_arch,
+					   kvmclock_sync_work);
+	struct kvm *kvm = container_of(ka, struct kvm, arch);
+
+	schedule_delayed_work(&kvm->arch.kvmclock_update_work, 0);
+	schedule_delayed_work(&kvm->arch.kvmclock_sync_work,
+					KVMCLOCK_SYNC_PERIOD);
 }
 
 static bool msr_mtrr_valid(unsigned msr)
@@ -1952,6 +1948,7 @@ int kvm_dev_ioctl_check_extension(long ext)
 	case KVM_CAP_ADJUST_CLOCK:
 	case KVM_CAP_VCPU_EVENTS:
 	case KVM_CAP_HYPERV:
+	case KVM_CAP_PCI_SEGMENT:
 	case KVM_CAP_XSAVE:
 	case KVM_CAP_GET_TSC_KHZ:
 	case KVM_CAP_KVMCLOCK_CTRL:
@@ -1964,7 +1961,7 @@ int kvm_dev_ioctl_check_extension(long ext)
 		r = !kvm_x86_ops->cpu_has_accelerated_tpr();
 		break;
 	case KVM_CAP_NR_VCPUS:
-		r = KVM_MAX_VCPUS;
+		r = KVM_MAX_VCPU_COUNT;
 		break;
 	case KVM_CAP_NR_MEMSLOTS:
 		r = KVM_MEMORY_SLOTS;
@@ -2252,10 +2249,12 @@ static void do_cpuid_ent(struct kvm_cpuid_entry2 *entry, u32 function,
 			 u32 index, int *nent, int maxnent)
 {
 	unsigned f_nx = is_efer_nx() ? F(NX) : 0;
-	unsigned f_gbpages = kvm_x86_ops->gb_page_enable() ? F(GBPAGES) : 0;
 #ifdef CONFIG_X86_64
+	unsigned f_gbpages = (kvm_x86_ops->get_lpage_level() == PT_PDPE_LEVEL)
+				? F(GBPAGES) : 0;
 	unsigned f_lm = F(LM);
 #else
+	unsigned f_gbpages = 0;
 	unsigned f_lm = 0;
 #endif
 	unsigned f_invpcid = kvm_x86_ops->invpcid_supported() ? F(INVPCID) : 0;
@@ -2300,7 +2299,8 @@ static void do_cpuid_ent(struct kvm_cpuid_entry2 *entry, u32 function,
 	/* cpuid 7.0.ebx */
 	const u32 kvm_supported_word9_x86_features =
 		F(FSGSBASE) | F(BMI1) | F(HLE) | F(AVX2) | F(SMEP) |
-		F(BMI2) | F(ERMS) | f_invpcid | F(RTM);
+		F(BMI2) | F(ERMS) | f_invpcid | F(RTM) | F(RDSEED) |
+		F(ADX);
 
 	/* all calls to cpuid_count() should be made on the same cpu */
 	get_cpu();
@@ -2461,6 +2461,13 @@ static void do_cpuid_ent(struct kvm_cpuid_entry2 *entry, u32 function,
 		entry->ecx &= kvm_supported_word6_x86_features;
 		cpuid_mask(&entry->ecx, 6);
 		break;
+	case 0x80000007: /* Advanced power management */
+		/* invariant TSC is CPUID.80000007H:EDX[8] */
+		entry->edx &= 1 << 8;
+		/* mask against host */
+		entry->edx &= boot_cpu_data.x86_power;
+		entry->eax = entry->ebx = entry->ecx = 0;
+		break;
 	case 0x80000008: {
 		unsigned g_phys_as = (entry->eax >> 16) & 0xff;
 		unsigned virt_as = max((entry->eax >> 8) & 0xff, 48U);
@@ -2482,7 +2489,6 @@ static void do_cpuid_ent(struct kvm_cpuid_entry2 *entry, u32 function,
 	case 3: /* Processor serial number */
 	case 5: /* MONITOR/MWAIT */
 	case 6: /* Thermal management */
-	case 0x80000007: /* Advanced power management */
 	default:
 		entry->eax = entry->ebx = entry->ecx = entry->edx = 0;
 		break;
@@ -2975,8 +2981,7 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
 		r = -EFAULT;
 		if (copy_from_user(&va, argp, sizeof va))
 			goto out;
-		r = 0;
-		kvm_lapic_set_vapic_addr(vcpu, va.vapic_addr);
+		r = kvm_lapic_set_vapic_addr(vcpu, va.vapic_addr);
 		break;
 	}
 	case KVM_X86_SETUP_MCE: {
@@ -3871,14 +3876,18 @@ static int kvm_read_guest_virt_system(gva_t addr, void *val, unsigned int bytes,
 	return kvm_read_guest_virt_helper(addr, val, bytes, vcpu, 0, error);
 }
 
-static int kvm_write_guest_virt(gva_t addr, void *val, unsigned int bytes,
-				struct kvm_vcpu *vcpu, u32 *error)
+static int kvm_write_guest_virt_helper(gva_t addr, void *val,
+				       unsigned int bytes,
+				       struct kvm_vcpu *vcpu, u32 access,
+				       u32 *error)
 {
 	void *data = val;
 	int r = X86EMUL_CONTINUE;
 
+	access |= PFERR_WRITE_MASK;
+
 	while (bytes) {
-		gpa_t gpa = kvm_mmu_gva_to_gpa_write(vcpu, addr, error);
+		gpa_t gpa = vcpu->arch.mmu.gva_to_gpa(vcpu, addr, access, error);
 		unsigned offset = addr & (PAGE_SIZE-1);
 		unsigned towrite = min(bytes, (unsigned)PAGE_SIZE - offset);
 		int ret;
@@ -3901,6 +3910,19 @@ out:
 	return r;
 }
 
+static int kvm_write_guest_virt(gva_t addr, void *val, unsigned int bytes,
+				struct kvm_vcpu *vcpu, u32 *error)
+{
+	u32 access = (kvm_x86_ops->get_cpl(vcpu) == 3) ? PFERR_USER_MASK : 0;
+	return kvm_write_guest_virt_helper(addr, val, bytes, vcpu, access, error);
+}
+
+static int kvm_write_guest_virt_system(gva_t addr, void *val,
+				       unsigned int bytes,
+				       struct kvm_vcpu *vcpu, u32 *error)
+{
+	return kvm_write_guest_virt_helper(addr, val, bytes, vcpu, 0, error);
+}
 
 static int emulator_read_emulated(unsigned long addr,
 				  void *val,
@@ -5084,33 +5106,6 @@ static void post_kvm_run_save(struct kvm_vcpu *vcpu)
 			!kvm_event_needs_reinjection(vcpu);
 }
 
-static void vapic_enter(struct kvm_vcpu *vcpu)
-{
-	struct kvm_lapic *apic = vcpu->arch.apic;
-	struct page *page;
-
-	if (!apic || !apic->vapic_addr)
-		return;
-
-	page = gfn_to_page(vcpu->kvm, apic->vapic_addr >> PAGE_SHIFT);
-
-	vcpu->arch.apic->vapic_page = page;
-}
-
-static void vapic_exit(struct kvm_vcpu *vcpu)
-{
-	struct kvm_lapic *apic = vcpu->arch.apic;
-	int idx;
-
-	if (!apic || !apic->vapic_addr)
-		return;
-
-	idx = srcu_read_lock(&vcpu->kvm->srcu);
-	kvm_release_page_dirty(apic->vapic_page);
-	mark_page_dirty(vcpu->kvm, apic->vapic_addr >> PAGE_SHIFT);
-	srcu_read_unlock(&vcpu->kvm->srcu, idx);
-}
-
 static void update_cr8_intercept(struct kvm_vcpu *vcpu)
 {
 	int max_irr, tpr;
@@ -5344,7 +5339,6 @@ static int __vcpu_run(struct kvm_vcpu *vcpu)
 	}
 
 	vcpu->srcu_idx = srcu_read_lock(&kvm->srcu);
-	vapic_enter(vcpu);
 
 	r = 1;
 	while (r > 0) {
@@ -5395,8 +5389,6 @@ static int __vcpu_run(struct kvm_vcpu *vcpu)
 	}
 
 	srcu_read_unlock(&kvm->srcu, vcpu->srcu_idx);
-
-	vapic_exit(vcpu);
 
 	return r;
 }
@@ -5697,28 +5689,21 @@ static int save_guest_segment_descriptor(struct kvm_vcpu *vcpu, u16 selector,
 {
 	struct descriptor_table dtable;
 	u16 index = selector >> 3;
+	int ret;
+	u32 err;
+	gva_t addr;
 
 	get_segment_descriptor_dtable(vcpu, selector, &dtable);
 
 	if (dtable.limit < index * 8 + 7)
 		return 1;
-	return kvm_write_guest_virt(dtable.base + index*8, seg_desc, sizeof(*seg_desc), vcpu, NULL);
-}
+	addr = dtable.base + index*8;
+	ret =  kvm_write_guest_virt_system(addr, seg_desc,
+					   sizeof(*seg_desc), vcpu, &err);
+	if (ret == X86EMUL_PROPAGATE_FAULT)
+		kvm_inject_page_fault(vcpu, addr, err);
 
-static gpa_t get_tss_base_addr_write(struct kvm_vcpu *vcpu,
-			       struct desc_struct *seg_desc)
-{
-	u32 base_addr = get_desc_base(seg_desc);
-
-	return kvm_mmu_gva_to_gpa_write(vcpu, base_addr, NULL);
-}
-
-static gpa_t get_tss_base_addr_read(struct kvm_vcpu *vcpu,
-			     struct desc_struct *seg_desc)
-{
-	u32 base_addr = get_desc_base(seg_desc);
-
-	return kvm_mmu_gva_to_gpa_read(vcpu, base_addr, NULL);
+	return ret;
 }
 
 static u16 get_segment_selector(struct kvm_vcpu *vcpu, int seg)
@@ -5854,7 +5839,9 @@ int kvm_load_segment_descriptor(struct kvm_vcpu *vcpu, u16 selector, int seg)
 		/* mark segment as accessed */
 		kvm_seg.type |= 1;
 		seg_desc.type |= 1;
-		save_guest_segment_descriptor(vcpu, selector, &seg_desc);
+		ret = save_guest_segment_descriptor(vcpu, selector, &seg_desc);
+		if (ret != X86EMUL_CONTINUE)
+			return ret;
 	}
 load:
 	kvm_set_segment(vcpu, &kvm_seg, seg);
@@ -5898,6 +5885,8 @@ static void kvm_load_segment_selector(struct kvm_vcpu *vcpu, u16 sel, int seg)
 static int load_state_from_tss32(struct kvm_vcpu *vcpu,
 				  struct tss_segment_32 *tss)
 {
+	int ret;
+
 	kvm_set_cr3(vcpu, tss->cr3);
 
 	kvm_rip_write(vcpu, tss->eip);
@@ -5928,26 +5917,33 @@ static int load_state_from_tss32(struct kvm_vcpu *vcpu,
 	 * Now load segment descriptors. If fault happenes at this stage
 	 * it is handled in a context of new task
 	 */
-	if (kvm_load_segment_descriptor(vcpu, tss->ldt_selector, VCPU_SREG_LDTR))
-		return 1;
+	ret = kvm_load_segment_descriptor(vcpu, tss->ldt_selector, VCPU_SREG_LDTR);
+	if (ret != X86EMUL_CONTINUE)
+		return ret;
 
-	if (kvm_load_segment_descriptor(vcpu, tss->es, VCPU_SREG_ES))
-		return 1;
+	ret = kvm_load_segment_descriptor(vcpu, tss->es, VCPU_SREG_ES);
+	if (ret != X86EMUL_CONTINUE)
+		return ret;
 
-	if (kvm_load_segment_descriptor(vcpu, tss->cs, VCPU_SREG_CS))
-		return 1;
+	ret = kvm_load_segment_descriptor(vcpu, tss->cs, VCPU_SREG_CS);
+	if (ret != X86EMUL_CONTINUE)
+		return ret;
 
-	if (kvm_load_segment_descriptor(vcpu, tss->ss, VCPU_SREG_SS))
-		return 1;
+	ret = kvm_load_segment_descriptor(vcpu, tss->ss, VCPU_SREG_SS);
+	if (ret != X86EMUL_CONTINUE)
+		return ret;
 
-	if (kvm_load_segment_descriptor(vcpu, tss->ds, VCPU_SREG_DS))
-		return 1;
+	ret = kvm_load_segment_descriptor(vcpu, tss->ds, VCPU_SREG_DS);
+	if (ret != X86EMUL_CONTINUE)
+		return ret;
 
-	if (kvm_load_segment_descriptor(vcpu, tss->fs, VCPU_SREG_FS))
-		return 1;
+	ret = kvm_load_segment_descriptor(vcpu, tss->fs, VCPU_SREG_FS);
+	if (ret != X86EMUL_CONTINUE)
+		return ret;
 
-	if (kvm_load_segment_descriptor(vcpu, tss->gs, VCPU_SREG_GS))
-		return 1;
+	ret = kvm_load_segment_descriptor(vcpu, tss->gs, VCPU_SREG_GS);
+	if (ret != X86EMUL_CONTINUE)
+		return ret;
 	return 0;
 }
 
@@ -5975,6 +5971,8 @@ static void save_state_to_tss16(struct kvm_vcpu *vcpu,
 static int load_state_from_tss16(struct kvm_vcpu *vcpu,
 				 struct tss_segment_16 *tss)
 {
+	int ret;
+
 	kvm_rip_write(vcpu, tss->ip);
 	kvm_x86_ops->set_rflags(vcpu, tss->flag | 2);
 	kvm_register_write(vcpu, VCPU_REGS_RAX, tss->ax);
@@ -6000,20 +5998,25 @@ static int load_state_from_tss16(struct kvm_vcpu *vcpu,
 	 * Now load segment descriptors. If fault happenes at this stage
 	 * it is handled in a context of new task
 	 */
-	if (kvm_load_segment_descriptor(vcpu, tss->ldt, VCPU_SREG_LDTR))
-		return 1;
+	ret = kvm_load_segment_descriptor(vcpu, tss->ldt, VCPU_SREG_LDTR);
+	if (ret != X86EMUL_CONTINUE)
+		return ret;
 
-	if (kvm_load_segment_descriptor(vcpu, tss->es, VCPU_SREG_ES))
-		return 1;
+	ret = kvm_load_segment_descriptor(vcpu, tss->es, VCPU_SREG_ES);
+	if (ret != X86EMUL_CONTINUE)
+		return ret;
 
-	if (kvm_load_segment_descriptor(vcpu, tss->cs, VCPU_SREG_CS))
-		return 1;
+	ret = kvm_load_segment_descriptor(vcpu, tss->cs, VCPU_SREG_CS);
+	if (ret != X86EMUL_CONTINUE)
+		return ret;
 
-	if (kvm_load_segment_descriptor(vcpu, tss->ss, VCPU_SREG_SS))
-		return 1;
+	ret = kvm_load_segment_descriptor(vcpu, tss->ss, VCPU_SREG_SS);
+	if (ret != X86EMUL_CONTINUE)
+		return ret;
 
-	if (kvm_load_segment_descriptor(vcpu, tss->ds, VCPU_SREG_DS))
-		return 1;
+	ret = kvm_load_segment_descriptor(vcpu, tss->ds, VCPU_SREG_DS);
+	if (ret != X86EMUL_CONTINUE)
+		return ret;
 	return 0;
 }
 
@@ -6022,37 +6025,56 @@ static int kvm_task_switch_16(struct kvm_vcpu *vcpu, u16 tss_selector,
 			      struct desc_struct *nseg_desc)
 {
 	struct tss_segment_16 tss_segment_16;
-	int ret = 0;
+	int ret;
+	u32 err;
+	gva_t addr;
+	u32 new_tss_base = get_desc_base(nseg_desc);
 
-	if (kvm_read_guest(vcpu->kvm, old_tss_base, &tss_segment_16,
-			   sizeof tss_segment_16))
+	addr = old_tss_base;
+	ret = kvm_read_guest_virt_system(addr, &tss_segment_16,
+				         sizeof tss_segment_16,
+					 vcpu, &err);
+	if (ret != X86EMUL_CONTINUE)
+		/* FIXME: need to provide precise fault address */
 		goto out;
 
 	save_state_to_tss16(vcpu, &tss_segment_16);
 
-	if (kvm_write_guest(vcpu->kvm, old_tss_base, &tss_segment_16,
-			    sizeof tss_segment_16))
+	ret = kvm_write_guest_virt_system(addr, &tss_segment_16,
+					  sizeof tss_segment_16,
+					  vcpu, &err);
+	if (ret != X86EMUL_CONTINUE)
+		/* FIXME: need to provide precise fault address */
 		goto out;
 
-	if (kvm_read_guest(vcpu->kvm, get_tss_base_addr_read(vcpu, nseg_desc),
-			   &tss_segment_16, sizeof tss_segment_16))
+	addr = new_tss_base;
+	ret = kvm_read_guest_virt_system(addr, &tss_segment_16,
+					 sizeof tss_segment_16,
+					 vcpu, &err);
+	if (ret != X86EMUL_CONTINUE)
+		/* FIXME: need to provide precise fault address */
 		goto out;
 
 	if (old_tss_sel != 0xffff) {
 		tss_segment_16.prev_task_link = old_tss_sel;
 
-		if (kvm_write_guest(vcpu->kvm,
-				    get_tss_base_addr_write(vcpu, nseg_desc),
-				    &tss_segment_16.prev_task_link,
-				    sizeof tss_segment_16.prev_task_link))
+		ret = kvm_write_guest_virt_system(addr,
+						  &tss_segment_16.prev_task_link,
+						  sizeof tss_segment_16.prev_task_link,
+						  vcpu, &err);
+		if (ret != X86EMUL_CONTINUE)
+			/* FIXME: need to provide precise fault address */
 			goto out;
 	}
 
-	if (load_state_from_tss16(vcpu, &tss_segment_16))
-		goto out;
+	ret = load_state_from_tss16(vcpu, &tss_segment_16);
+	if (ret != X86EMUL_CONTINUE)
+		/* Fault already injected, exit.  */
+		return ret;
 
-	ret = 1;
 out:
+	if (ret == X86EMUL_PROPAGATE_FAULT)
+		kvm_inject_page_fault(vcpu, addr, err);
 	return ret;
 }
 
@@ -6062,88 +6084,147 @@ static int kvm_task_switch_32(struct kvm_vcpu *vcpu, u16 tss_selector,
 		       bool has_error_code, u32 error_code)
 {
 	struct tss_segment_32 tss_segment_32;
-	int ret = 0;
+	int ret;
+	u32 err;
+	gva_t addr;
+	u32 new_tss_base = get_desc_base(nseg_desc);
 
-	if (kvm_read_guest(vcpu->kvm, old_tss_base, &tss_segment_32,
-			   sizeof tss_segment_32))
+	addr = old_tss_base;
+	ret = kvm_read_guest_virt_system(addr, &tss_segment_32,
+				         sizeof tss_segment_32,
+					 vcpu, &err);
+	if (ret != X86EMUL_CONTINUE)
+		/* FIXME: need to provide precise fault address */
 		goto out;
 
 	save_state_to_tss32(vcpu, &tss_segment_32);
 
-	if (kvm_write_guest(vcpu->kvm, old_tss_base, &tss_segment_32,
-			    sizeof tss_segment_32))
+	ret = kvm_write_guest_virt_system(addr, &tss_segment_32,
+					  sizeof tss_segment_32,
+					  vcpu, &err);
+	if (ret != X86EMUL_CONTINUE)
+		/* FIXME: need to provide precise fault address */
 		goto out;
 
-	if (kvm_read_guest(vcpu->kvm, get_tss_base_addr_read(vcpu, nseg_desc),
-			   &tss_segment_32, sizeof tss_segment_32))
+	addr = new_tss_base;
+	ret = kvm_read_guest_virt_system(addr, &tss_segment_32,
+				         sizeof tss_segment_32,
+					 vcpu, &err);
+	if (ret != X86EMUL_CONTINUE)
+		/* FIXME: need to provide precise fault address */
 		goto out;
 
 	if (old_tss_sel != 0xffff) {
 		tss_segment_32.prev_task_link = old_tss_sel;
 
-		if (kvm_write_guest(vcpu->kvm,
-				    get_tss_base_addr_write(vcpu, nseg_desc),
-				    &tss_segment_32.prev_task_link,
-				    sizeof tss_segment_32.prev_task_link))
+		ret = kvm_write_guest_virt_system(addr,
+						  &tss_segment_32.prev_task_link,
+						  sizeof tss_segment_32.prev_task_link,
+						  vcpu, &err);
+		if (ret != X86EMUL_CONTINUE)
+			/* FIXME: need to provide precise fault address */
 			goto out;
 	}
 
-	if (load_state_from_tss32(vcpu, &tss_segment_32))
-		goto out;
-
-	ret = 1;
+	ret = load_state_from_tss32(vcpu, &tss_segment_32);
+	if (ret != X86EMUL_CONTINUE)
+		/* Fault already injected, exit.  */
+		return ret;
 
 	if (has_error_code) {
 		/* put error on a stack of the new task */
-		gva_t sp = kvm_register_read(vcpu, VCPU_REGS_RSP) - 4, lsp;
-		u32 limit, err;
+		gva_t sp = kvm_register_read(vcpu, VCPU_REGS_RSP) - 4;
+		u32 limit;
 		struct kvm_segment ss;
-		int r;
 
 		kvm_get_segment(vcpu, &ss, VCPU_SREG_SS);
 		limit = (ss.g ? (ss.limit << 12) | 0xfff : ss.limit) + 1;
-		lsp = sp + ss.base;
+		addr = sp + ss.base;
 		if (limit)
-			lsp %= limit;
-		r = kvm_write_guest_virt(lsp, &error_code, 4, vcpu, &err);
-		if (r == X86EMUL_PROPAGATE_FAULT)
-			kvm_inject_page_fault(vcpu, lsp, err);
-		else if (r == X86EMUL_UNHANDLEABLE)
-			ret = 0;
-		else
-			kvm_register_write(vcpu, VCPU_REGS_RSP, sp);
+			addr %= limit;
+		ret = kvm_write_guest_virt_system(addr, &error_code, 4, vcpu, &err);
+		if (ret != X86EMUL_CONTINUE)
+			goto out;
+
+		kvm_register_write(vcpu, VCPU_REGS_RSP, sp);
 	}
 
 out:
+	if (ret == X86EMUL_PROPAGATE_FAULT)
+		kvm_inject_page_fault(vcpu, addr, err);
 	return ret;
 }
 
-int kvm_task_switch(struct kvm_vcpu *vcpu, u16 tss_selector, int reason,
+static int read_interrupt_descriptor(struct kvm_vcpu *vcpu,
+				     u16 index, struct desc_struct *desc)
+{
+	struct descriptor_table dt;
+	int ret;
+	u32 err;
+	gva_t addr;
+
+	kvm_x86_ops->get_idt(vcpu, &dt);
+
+	if (dt.limit < index * 8 + 7) {
+		kvm_queue_exception_e(vcpu, GP_VECTOR, (index << 3) | 0x2);
+		return 1;
+	}
+	addr = dt.base + index * 8;
+	ret = kvm_read_guest_virt_system(addr, desc, sizeof(*desc),
+					 vcpu,  &err);
+	if (ret == X86EMUL_PROPAGATE_FAULT)
+		kvm_inject_page_fault(vcpu, addr, err);
+
+	return ret;
+}
+
+int kvm_task_switch(struct kvm_vcpu *vcpu, u16 tss_selector,
+		    int idt_index, int reason,
 		    bool has_error_code, u32 error_code)
 {
 	struct kvm_segment tr_seg;
 	struct desc_struct cseg_desc;
 	struct desc_struct nseg_desc;
-	int ret = 0;
+	int ret;
 	u32 old_tss_base = get_segment_base(vcpu, VCPU_SREG_TR);
 	u16 old_tss_sel = get_segment_selector(vcpu, VCPU_SREG_TR);
 
-	old_tss_base = kvm_mmu_gva_to_gpa_write(vcpu, old_tss_base, NULL);
-
-	/* FIXME: Handle errors. Failure to read either TSS or their
-	 * descriptors should generate a pagefault.
-	 */
 	if (load_guest_segment_descriptor(vcpu, tss_selector, &nseg_desc))
-		goto out;
+		return 0;
 
 	if (load_guest_segment_descriptor(vcpu, old_tss_sel, &cseg_desc))
-		goto out;
+		return 0;
 
-	if (reason != TASK_SWITCH_IRET) {
-		int cpl;
+	/*
+	 * Check privileges. The three cases are task switch caused by...
+	 *
+	 * 1. jmp/call/int to task gate: Check against DPL of the task gate
+	 * 2. Exception/IRQ/iret: No check is performed
+	 * 3. jmp/call to TSS: Check agains DPL of the TSS
+	 */
+	if (reason == TASK_SWITCH_GATE) {
+		if (idt_index != -1) {
+			/* Software interrupts */
+			struct desc_struct task_gate_desc;
+			int dpl, cpl;
 
+			if (read_interrupt_descriptor(vcpu, idt_index,
+						      &task_gate_desc))
+				return 0;
+
+			dpl = task_gate_desc.dpl;
+			cpl = kvm_x86_ops->get_cpl(vcpu);
+			if ((tss_selector & 3) > dpl || cpl > dpl) {
+				kvm_queue_exception_e(vcpu, GP_VECTOR, (idt_index << 3) | 0x2);
+				return 1;
+			}
+		}
+	} else if (reason != TASK_SWITCH_IRET) {
+		int dpl, cpl;
+
+		dpl = nseg_desc.dpl;
 		cpl = kvm_x86_ops->get_cpl(vcpu);
-		if ((tss_selector & 3) > nseg_desc.dpl || cpl > nseg_desc.dpl) {
+		if ((tss_selector & 3) > dpl || cpl > dpl) {
 			kvm_queue_exception_e(vcpu, GP_VECTOR, 0);
 			return 1;
 		}
@@ -6156,7 +6237,10 @@ int kvm_task_switch(struct kvm_vcpu *vcpu, u16 tss_selector, int reason,
 
 	if (reason == TASK_SWITCH_IRET || reason == TASK_SWITCH_JMP) {
 		cseg_desc.type &= ~(1 << 1); //clear the B flag
-		save_guest_segment_descriptor(vcpu, old_tss_sel, &cseg_desc);
+		ret = save_guest_segment_descriptor(vcpu, old_tss_sel,
+						    &cseg_desc);
+		if (ret != X86EMUL_CONTINUE)
+			return 1;
 	}
 
 	if (reason == TASK_SWITCH_IRET) {
@@ -6182,6 +6266,10 @@ int kvm_task_switch(struct kvm_vcpu *vcpu, u16 tss_selector, int reason,
 		ret = kvm_task_switch_16(vcpu, tss_selector, old_tss_sel,
 					 old_tss_base, &nseg_desc);
 
+	/* Proceed in new task if a page fault happened, otherwise exit.  */
+	if (ret == X86EMUL_UNHANDLEABLE)
+		return 0;
+
 	if (reason == TASK_SWITCH_CALL || reason == TASK_SWITCH_GATE) {
 		u32 eflags = kvm_x86_ops->get_rflags(vcpu);
 		kvm_x86_ops->set_rflags(vcpu, eflags | X86_EFLAGS_NT);
@@ -6197,8 +6285,7 @@ int kvm_task_switch(struct kvm_vcpu *vcpu, u16 tss_selector, int reason,
 	seg_desct_to_kvm_desct(&nseg_desc, tss_selector, &tr_seg);
 	tr_seg.type = 11;
 	kvm_set_segment(vcpu, &tr_seg, VCPU_SREG_TR);
-out:
-	return ret;
+	return 1;
 }
 EXPORT_SYMBOL_GPL(kvm_task_switch);
 
@@ -6466,6 +6553,7 @@ free_vcpu:
 int kvm_arch_vcpu_postcreate(struct kvm_vcpu *vcpu)
 {
 	struct msr_data msr;
+	struct kvm *kvm = vcpu->kvm;
 
 	vcpu_load(vcpu);
 	msr.data = 0x0;
@@ -6473,6 +6561,9 @@ int kvm_arch_vcpu_postcreate(struct kvm_vcpu *vcpu)
 	msr.host_initiated = true;
 	kvm_write_tsc(vcpu, &msr);
 	vcpu_put(vcpu);
+
+	schedule_delayed_work(&kvm->arch.kvmclock_sync_work,
+					KVMCLOCK_SYNC_PERIOD);
 
 	return 0;
 }
@@ -6680,6 +6771,11 @@ void kvm_arch_vcpu_uninit(struct kvm_vcpu *vcpu)
 	free_page((unsigned long)vcpu->arch.pio_data);
 }
 
+void kvm_arch_sched_in(struct kvm_vcpu *vcpu, int cpu)
+{
+	kvm_x86_ops->sched_in(vcpu, cpu);
+}
+
 struct  kvm *kvm_arch_create_vm(void)
 {
 	struct kvm *kvm = kzalloc(sizeof(struct kvm), GFP_KERNEL);
@@ -6700,6 +6796,9 @@ struct  kvm *kvm_arch_create_vm(void)
 	set_bit(KVM_USERSPACE_IRQ_SOURCE_ID, &kvm->arch.irq_sources_bitmap);
 
 	spin_lock_init(&kvm->arch.tsc_write_lock);
+
+	INIT_DELAYED_WORK(&kvm->arch.kvmclock_update_work, kvmclock_update_fn);
+	INIT_DELAYED_WORK(&kvm->arch.kvmclock_sync_work, kvmclock_sync_fn);
 
 	return kvm;
 }
@@ -6734,6 +6833,8 @@ static void kvm_free_vcpus(struct kvm *kvm)
 
 void kvm_arch_sync_events(struct kvm *kvm)
 {
+	cancel_delayed_work_sync(&kvm->arch.kvmclock_sync_work);
+	cancel_delayed_work_sync(&kvm->arch.kvmclock_update_work);
 	kvm_free_all_assigned_devices(kvm);
 	kvm_free_pit(kvm);
 }
@@ -6867,3 +6968,4 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_page_fault);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_msr);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_cr);
 EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_write_tsc_offset);
+EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_ple_window);

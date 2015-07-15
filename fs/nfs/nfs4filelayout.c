@@ -122,7 +122,6 @@ static int filelayout_async_handle_error(struct rpc_task *task,
 		break;
 	case -NFS4ERR_DELAY:
 	case -NFS4ERR_GRACE:
-	case -EKEYEXPIRED:
 		rpc_delay(task, FILELAYOUT_POLL_RETRY_MAX);
 		break;
 	case -NFS4ERR_RETRY_UNCACHED_REP:
@@ -211,8 +210,9 @@ static void filelayout_read_prepare(struct rpc_task *task, void *data)
 		return;
 
 	rpc_call_start(task);
-	nfs4_set_rw_stateid(&rdata->args.stateid, rdata->args.context,
-			rdata->args.lock_context, FMODE_READ);
+	if (nfs4_set_rw_stateid(&rdata->args.stateid, rdata->args.context,
+			rdata->args.lock_context, FMODE_READ) == -EIO)
+		rpc_exit(task, -EIO); /* lost lock, terminate I/O */
 }
 
 static void filelayout_read_call_done(struct rpc_task *task, void *data)
@@ -306,8 +306,9 @@ static void filelayout_write_prepare(struct rpc_task *task, void *data)
 		return;
 
 	rpc_call_start(task);
-	nfs4_set_rw_stateid(&wdata->args.stateid, wdata->args.context,
-			wdata->args.lock_context, FMODE_WRITE);
+	if (nfs4_set_rw_stateid(&wdata->args.stateid, wdata->args.context,
+			wdata->args.lock_context, FMODE_WRITE) == -EIO)
+		rpc_exit(task, -EIO); /* lost lock, terminate I/O */
 }
 
 static void filelayout_write_call_done(struct rpc_task *task, void *data)

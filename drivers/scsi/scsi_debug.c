@@ -126,6 +126,7 @@ static const char * scsi_debug_version_date = "20100324";
 #define SCSI_DEBUG_OPT_TRANSPORT_ERR   16
 #define SCSI_DEBUG_OPT_DIF_ERR   32
 #define SCSI_DEBUG_OPT_DIX_ERR   64
+#define SCSI_DEBUG_OPT_MAC_TIMEOUT  128
 /* When "every_nth" > 0 then modulo "every_nth" commands:
  *   - a no response is simulated if SCSI_DEBUG_OPT_TIMEOUT is set
  *   - a RECOVERED_ERROR is simulated on successful read and write
@@ -2646,8 +2647,8 @@ static void __init sdebug_build_parts(unsigned char *ramp,
 			       / sdebug_sectors_per;
 		pp->end_sector = (end_sec % sdebug_sectors_per) + 1;
 
-		pp->start_sect = start_sec;
-		pp->nr_sects = end_sec - start_sec + 1;
+		pp->start_sect = cpu_to_le32(start_sec);
+		pp->nr_sects = cpu_to_le32(end_sec - start_sec + 1);
 		pp->sys_ind = 0x83;	/* plain Linux partition */
 	}
 }
@@ -3621,6 +3622,9 @@ int scsi_debug_queuecommand(struct scsi_cmnd *SCpnt, done_funct_t done)
 			scsi_debug_every_nth = -1;
 		if (SCSI_DEBUG_OPT_TIMEOUT & scsi_debug_opts)
 			return 0; /* ignore command causing timeout */
+		else if (SCSI_DEBUG_OPT_MAC_TIMEOUT & scsi_debug_opts &&
+			 scsi_medium_access_command(SCpnt))
+			return 0; /* time out reads and writes */
 		else if (SCSI_DEBUG_OPT_RECOVERED_ERR & scsi_debug_opts)
 			inj_recovered = 1; /* to reads and writes below */
 		else if (SCSI_DEBUG_OPT_TRANSPORT_ERR & scsi_debug_opts)

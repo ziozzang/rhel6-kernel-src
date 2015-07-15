@@ -1669,9 +1669,8 @@ static int cgroup_task_migrate(struct cgroup *cgrp, struct cgroup *oldcgrp,
 	 * trading it for newcg is protected by cgroup_mutex, we're safe to drop
 	 * it here; it will be freed under RCU.
 	 */
-	put_css_set(oldcg);
-
 	set_bit(CGRP_RELEASABLE, &oldcgrp->flags);
+	put_css_set(oldcg);
 	return 0;
 }
 
@@ -1964,11 +1963,6 @@ int cgroup_attach_proc(struct cgroup *cgrp, struct task_struct *leader)
 			continue;
 		/* get old css_set pointer */
 		task_lock(tsk);
-		if (tsk->flags & PF_EXITING) {
-			/* ignore this task if it's going away */
-			task_unlock(tsk);
-			continue;
-		}
 		oldcg = tsk->cgroups;
 		get_css_set(oldcg);
 		task_unlock(tsk);
@@ -3647,7 +3641,7 @@ static long cgroup_create(struct cgroup *parent, struct dentry *dentry,
  err_remove:
 
 	cgroup_lock_hierarchy(root);
-	list_del(&cgrp->sibling);
+	list_del_init(&cgrp->sibling);
 	cgroup_unlock_hierarchy(root);
 	root->number_of_cgroups--;
 
@@ -3759,6 +3753,8 @@ static int cgroup_clear_css_refs(struct cgroup *cgrp)
 	return !failed;
 }
 
+extern int mem_cgroup_force_empty_hack(struct cgroup *);
+
 static int cgroup_rmdir(struct inode *unused_dir, struct dentry *dentry)
 {
 	struct cgroup *cgrp = dentry->d_fsdata;
@@ -3809,7 +3805,13 @@ again:
 		return -EBUSY;
 	}
 	prepare_to_wait(&cgroup_rmdir_waitq, &wait, TASK_INTERRUPTIBLE);
-	if (!cgroup_clear_css_refs(cgrp)) {
+	/*
+	 * Because of swap-out records, memcg charges can show up in
+	 * empty groups between pre_destroy and clear_css_refs.  We
+	 * would reparent them in destroy() but that callback can't
+	 * fail and reparenting can.  Catch these charges here:
+	 */
+	if (!cgroup_clear_css_refs(cgrp) || mem_cgroup_force_empty_hack(cgrp)) {
 		mutex_unlock(&cgroup_mutex);
 		/*
 		 * Because someone may call cgroup_wakeup_rmdir_waiter() before
@@ -3830,12 +3832,12 @@ again:
 	spin_lock(&release_list_lock);
 	set_bit(CGRP_REMOVED, &cgrp->flags);
 	if (!list_empty(&cgrp->release_list))
-		list_del(&cgrp->release_list);
+		list_del_init(&cgrp->release_list);
 	spin_unlock(&release_list_lock);
 
 	cgroup_lock_hierarchy(cgrp->root);
 	/* delete this cgroup from parent->children */
-	list_del(&cgrp->sibling);
+	list_del_init(&cgrp->sibling);
 	cgroup_unlock_hierarchy(cgrp->root);
 
 	spin_lock(&cgrp->dentry->d_lock);
@@ -4212,7 +4214,7 @@ void cgroup_exit(struct task_struct *tsk, int run_callbacks)
 	if (!list_empty(&tsk->cg_list)) {
 		write_lock(&css_set_lock);
 		if (!list_empty(&tsk->cg_list))
-			list_del(&tsk->cg_list);
+			list_del_init(&tsk->cg_list);
 		write_unlock(&css_set_lock);
 	}
 

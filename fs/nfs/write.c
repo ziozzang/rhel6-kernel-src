@@ -844,7 +844,7 @@ int nfs_flush_incompatible(struct file *file, struct page *page)
 			return 0;
 		l_ctx = req->wb_lock_context;
 		do_flush = req->wb_page != page || req->wb_context != ctx;
-		if (l_ctx) {
+		if (l_ctx && ctx->dentry->d_inode->i_flock != NULL) {
 			do_flush |= l_ctx->lockowner.l_owner != current->files
 				|| l_ctx->lockowner.l_pid != current->tgid;
 		}
@@ -857,17 +857,51 @@ int nfs_flush_incompatible(struct file *file, struct page *page)
 }
 
 /*
+ * Avoid buffered writes when a open context credential's key would
+ * expire soon.
+ *
+ * Returns -EACCES if the key will expire within RPC_KEY_EXPIRE_FAIL.
+ *
+ * Return 0 and set a credential flag which triggers the inode to flush
+ * and performs  NFS_FILE_SYNC writes if the key will expired within
+ * RPC_KEY_EXPIRE_TIMEO.
+ */
+int
+nfs_key_timeout_notify(struct file *filp, struct inode *inode)
+{
+	struct nfs_open_context *ctx = nfs_file_open_context(filp);
+	struct rpc_auth *auth = NFS_SERVER(inode)->client->cl_auth;
+
+	return rpcauth_key_timeout_notify(auth, ctx->cred);
+}
+
+/*
+ * Test if the open context credential key is marked to expire soon.
+ */
+bool nfs_ctx_key_to_expire(struct nfs_open_context *ctx)
+{
+	return rpcauth_cred_key_to_expire(ctx->cred);
+}
+
+/*
  * If the page cache is marked as unsafe or invalid, then we can't rely on
  * the PageUptodate() flag. In this case, we will need to turn off
  * write optimisations that depend on the page contents being correct.
  */
 static bool nfs_write_pageuptodate(struct page *page, struct inode *inode)
 {
+	struct nfs_inode *nfsi = NFS_I(inode);
+
 	if (nfs_have_delegated_attributes(inode))
 		goto out;
-	if (NFS_I(inode)->cache_validity & (NFS_INO_INVALID_DATA|NFS_INO_REVAL_PAGECACHE))
+	if (nfsi->cache_validity & NFS_INO_REVAL_PAGECACHE)
+		return false;
+	smp_rmb();
+	if (test_bit(NFS_INO_INVALIDATING, &nfsi->flags))
 		return false;
 out:
+	if (nfsi->cache_validity & NFS_INO_INVALID_DATA)
+		return false;
 	return PageUptodate(page) != 0;
 }
 
@@ -876,19 +910,20 @@ out:
  * extend the write to cover the entire page in order to avoid fragmentation
  * inefficiencies.
  *
- * If the file is opened O_SYNC or if we have a write delegation from the server
- * then we can just skip the rest of the checks.
+ * If the file is opened for synchronous writes then we can just skip the rest
+ * of the checks.
  */
 static int nfs_can_extend_write(struct file *file, struct page *page, struct inode *inode)
 {
 	if (file->f_flags & O_SYNC)
 		return 0;
+	if (!nfs_write_pageuptodate(page, inode))
+		return 0;
 	if (nfs_have_delegation(inode, FMODE_WRITE))
 		return 1;
-	if (nfs_write_pageuptodate(page, inode) && (inode->i_flock == NULL ||
-			(inode->i_flock->fl_start == 0 &&
+	if (inode->i_flock == NULL || (inode->i_flock->fl_start == 0 &&
 			inode->i_flock->fl_end == OFFSET_MAX &&
-			inode->i_flock->fl_type != F_RDLCK)))
+			inode->i_flock->fl_type != F_RDLCK))
 		return 1;
 	return 0;
 }
@@ -1244,9 +1279,10 @@ EXPORT_SYMBOL_GPL(nfs_pageio_reset_write_mds);
 void nfs_write_prepare(struct rpc_task *task, void *calldata)
 {
 	struct nfs_write_data *data = calldata;
-	NFS_PROTO(data->header->inode)->write_rpc_prepare(task, data);
-	if (unlikely(test_bit(NFS_CONTEXT_BAD, &data->args.context->flags)))
-		rpc_exit(task, -EIO);
+	int err;
+	err = NFS_PROTO(data->header->inode)->write_rpc_prepare(task, data);
+	if (err)
+		rpc_exit(task, err);
 }
 
 void nfs_commit_prepare(struct rpc_task *task, void *calldata)

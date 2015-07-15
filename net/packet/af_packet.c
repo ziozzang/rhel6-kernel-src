@@ -1285,32 +1285,39 @@ static int packet_release(struct socket *sock)
  *	Attach a packet hook.
  */
 
-static int packet_do_bind(struct sock *sk, struct net_device *dev, __be16 protocol)
+static int packet_do_bind(struct sock *sk, struct net_device *dev, __be16 proto)
 {
 	struct packet_sock *po = pkt_sk(sk);
-	/*
-	 *	Detach an existing hook if present.
-	 */
+	const struct net_device *dev_curr;
+	__be16 proto_curr;
+	bool need_rehook;
 
 	lock_sock(sk);
-
 	spin_lock(&po->bind_lock);
-	if (po->running) {
-		__sock_put(sk);
-		po->running = 0;
-		po->num = 0;
-		spin_unlock(&po->bind_lock);
-		dev_remove_pack(&po->prot_hook);
-		spin_lock(&po->bind_lock);
+
+	proto_curr = po->prot_hook.type;
+	dev_curr = po->prot_hook.dev;
+
+	need_rehook = proto_curr != proto || dev_curr != dev;
+
+	if (need_rehook) {
+		if (po->running) {
+			__sock_put(sk);
+			po->running = 0;
+			po->num = 0;
+			spin_unlock(&po->bind_lock);
+			dev_remove_pack(&po->prot_hook);
+			spin_lock(&po->bind_lock);
+		}
+
+		po->num = proto;
+		po->prot_hook.type = proto;
+		po->prot_hook.dev = dev;
+
+		po->ifindex = dev ? dev->ifindex : 0;
 	}
 
-	po->num = protocol;
-	po->prot_hook.type = protocol;
-	po->prot_hook.dev = dev;
-
-	po->ifindex = dev ? dev->ifindex : 0;
-
-	if (protocol == 0)
+	if (proto == 0 || !need_rehook)
 		goto out_unlock;
 
 	if (!dev || (dev->flags & IFF_UP)) {
@@ -1517,12 +1524,12 @@ static int packet_recvmsg(struct kiocb *iocb, struct socket *sock,
 	struct sock *sk = sock->sk;
 	struct sk_buff *skb;
 	int copied, err;
-	struct sockaddr_ll *sll;
 
 	err = -EINVAL;
 	if (flags & ~(MSG_PEEK|MSG_DONTWAIT|MSG_TRUNC|MSG_CMSG_COMPAT|MSG_ERRQUEUE))
 		goto out;
 
+	msg->msg_namelen = 0;
 #if 0
 	/* What error should we return now? EUNATTACH? */
 	if (pkt_sk(sk)->ifindex < 0)
@@ -1554,22 +1561,10 @@ static int packet_recvmsg(struct kiocb *iocb, struct socket *sock,
 	if (skb == NULL)
 		goto out;
 
-	/*
-	 *	If the address length field is there to be filled in, we fill
-	 *	it in now.
+	/* You lose any data beyond the buffer you gave. If it worries
+	 * a user program they can ask the device for its MTU
+	 * anyway.
 	 */
-
-	sll = &PACKET_SKB_CB(skb)->sa.ll;
-	if (sock->type == SOCK_PACKET)
-		msg->msg_namelen = sizeof(struct sockaddr_pkt);
-	else
-		msg->msg_namelen = sll->sll_halen + offsetof(struct sockaddr_ll, sll_addr);
-
-	/*
-	 *	You lose any data beyond the buffer you gave. If it worries a
-	 *	user program they can ask the device for its MTU anyway.
-	 */
-
 	copied = skb->len;
 	if (copied > len) {
 		copied = len;
@@ -1582,9 +1577,20 @@ static int packet_recvmsg(struct kiocb *iocb, struct socket *sock,
 
 	sock_recv_ts_and_drops(msg, sk, skb);
 
-	if (msg->msg_name)
+	if (msg->msg_name) {
+		/* If the address length field is there to be filled
+		 * in, we fill it in now.
+		 */
+		if (sock->type == SOCK_PACKET) {
+			msg->msg_namelen = sizeof(struct sockaddr_pkt);
+		} else {
+			struct sockaddr_ll *sll = &PACKET_SKB_CB(skb)->sa.ll;
+			msg->msg_namelen = sll->sll_halen +
+				offsetof(struct sockaddr_ll, sll_addr);
+		}
 		memcpy(msg->msg_name, &PACKET_SKB_CB(skb)->sa,
 		       msg->msg_namelen);
+	}
 
 	if (pkt_sk(sk)->auxdata) {
 		struct tpacket_auxdata aux;

@@ -54,11 +54,11 @@ static int ext4_release_file(struct inode *inode, struct file *filp)
 	return 0;
 }
 
-void ext4_aiodio_wait(struct inode *inode)
+void ext4_unwritten_wait(struct inode *inode)
 {
 	wait_queue_head_t *wq = to_aio_wq(inode);
 
-	wait_event(*wq, (atomic_read(&EXT4_I(inode)->i_aiodio_unwritten) == 0));
+	wait_event(*wq, (atomic_read(&EXT4_I(inode)->i_unwritten) == 0));
 }
 
 /*
@@ -120,7 +120,7 @@ ext4_file_write(struct kiocb *iocb, const struct iovec *iov,
 	/* Unaligned direct AIO must be serialized; see comment above */
 	if (unaligned_aio) {
 		mutex_lock(&EXT4_I(inode)->i_aio_mutex);
-		ext4_aiodio_wait(inode);
+		ext4_unwritten_wait(inode);
  	}
 
 	ret = generic_file_aio_write(iocb, iov, nr_segs, pos);
@@ -181,9 +181,9 @@ static int ext4_file_open(struct inode * inode, struct file * filp)
 }
 
 /*
- * ext4_llseek() copied from generic_file_llseek() to handle both
- * block-mapped and extent-mapped maxbytes values. This should
- * otherwise be identical with generic_file_llseek().
+ * ext4_llseek() handles both block-mapped and extent-mapped maxbytes values
+ * by calling generic_file_llseek_size() with the appropriate maxbytes
+ * value for each.
  */
 loff_t ext4_llseek(struct file *file, loff_t offset, int origin)
 {
@@ -194,32 +194,9 @@ loff_t ext4_llseek(struct file *file, loff_t offset, int origin)
 		maxbytes = EXT4_SB(inode->i_sb)->s_bitmap_maxbytes;
 	else
 		maxbytes = inode->i_sb->s_maxbytes;
-	mutex_lock(&inode->i_mutex);
-	switch (origin) {
-	case SEEK_END:
-		offset += inode->i_size;
-		break;
-	case SEEK_CUR:
-		if (offset == 0) {
-			mutex_unlock(&inode->i_mutex);
-			return file->f_pos;
-		}
-		offset += file->f_pos;
-		break;
-	}
 
-	if (offset < 0 || offset > maxbytes) {
-		mutex_unlock(&inode->i_mutex);
-		return -EINVAL;
-	}
-
-	if (offset != file->f_pos) {
-		file->f_pos = offset;
-		file->f_version = 0;
-	}
-	mutex_unlock(&inode->i_mutex);
-
-	return offset;
+	return generic_file_llseek_size(file, offset, origin,
+					maxbytes, i_size_read(inode));
 }
 
 const struct file_operations ext4_file_operations = {

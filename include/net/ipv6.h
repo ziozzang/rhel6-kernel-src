@@ -39,6 +39,7 @@
 #define NEXTHDR_ICMP		58	/* ICMP for IPv6. */
 #define NEXTHDR_NONE		59	/* No next header */
 #define NEXTHDR_DEST		60	/* Destination options header. */
+#define NEXTHDR_SCTP		132	/* SCTP message. */
 #define NEXTHDR_MOBILITY	135	/* Mobility header. */
 
 #define NEXTHDR_MAX		255
@@ -267,10 +268,22 @@ static inline bool ipv6_accept_ra(struct inet6_dev *idev)
 	    idev->cnf.accept_ra;
 }
 
-int ip6_frag_nqueues(struct net *net);
-int ip6_frag_mem(struct net *net);
+#if IS_ENABLED(CONFIG_IPV6)
+static inline int ip6_frag_nqueues(struct net *net)
+{
+	struct netns_frags_priv *nf_priv = netns_frags_priv(&net->ipv6.frags);
+	return nf_priv->nqueues;
+}
 
-#define IPV6_FRAG_TIMEOUT	(60*HZ)		/* 60 seconds */
+static inline int ip6_frag_mem(struct net *net)
+{
+	return sum_frag_mem_limit(&net->ipv6.frags);
+}
+#endif
+
+#define IPV6_FRAG_HIGH_THRESH	(4 * 1024*1024)	/* 4194304 */
+#define IPV6_FRAG_LOW_THRESH	(3 * 1024*1024)	/* 3145728 */
+#define IPV6_FRAG_TIMEOUT	(60 * HZ)	/* 60 seconds */
 
 extern int __ipv6_addr_type(const struct in6_addr *addr);
 static inline int ipv6_addr_type(const struct in6_addr *addr)
@@ -389,7 +402,7 @@ struct ip6_create_arg {
 };
 
 void ip6_frag_init(struct inet_frag_queue *q, void *a);
-int ip6_frag_match(struct inet_frag_queue *q, void *a);
+bool ip6_frag_match(struct inet_frag_queue *q, void *a);
 
 static inline int ipv6_addr_any(const struct in6_addr *a)
 {
@@ -620,7 +633,7 @@ extern int			compat_ipv6_getsockopt(struct sock *sk,
 extern int			ip6_datagram_connect(struct sock *sk, 
 						     struct sockaddr *addr, int addr_len);
 
-extern int 			ipv6_recv_error(struct sock *sk, struct msghdr *msg, int len);
+extern int 			ipv6_recv_error(struct sock *sk, struct msghdr *msg, int len, int *addr_len);
 extern void			ipv6_icmp_error(struct sock *sk, struct sk_buff *skb, int err, __be16 port,
 						u32 info, u8 *payload);
 extern void			ipv6_local_error(struct sock *sk, int err, struct flowi *fl, u32 info);

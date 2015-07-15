@@ -2499,13 +2499,13 @@ void free_pages_exact(void *virt, size_t size)
 }
 EXPORT_SYMBOL(free_pages_exact);
 
-static unsigned int nr_free_zone_pages(int offset)
+static unsigned long nr_free_zone_pages(int offset)
 {
 	struct zoneref *z;
 	struct zone *zone;
 
 	/* Just pick one node, since fallback list is circular */
-	unsigned int sum = 0;
+	unsigned long sum = 0;
 
 	struct zonelist *zonelist = node_zonelist(numa_node_id(), GFP_KERNEL);
 
@@ -2522,7 +2522,7 @@ static unsigned int nr_free_zone_pages(int offset)
 /*
  * Amount of free RAM allocatable within ZONE_DMA and ZONE_NORMAL
  */
-unsigned int nr_free_buffer_pages(void)
+unsigned long nr_free_buffer_pages(void)
 {
 	return nr_free_zone_pages(gfp_zone(GFP_USER));
 }
@@ -2531,7 +2531,7 @@ EXPORT_SYMBOL_GPL(nr_free_buffer_pages);
 /*
  * Amount of free RAM allocatable within all zones
  */
-unsigned int nr_free_pagecache_pages(void)
+unsigned long nr_free_pagecache_pages(void)
 {
 	return nr_free_zone_pages(gfp_zone(GFP_HIGHUSER_MOVABLE));
 }
@@ -3348,6 +3348,8 @@ static void setup_zone_migrate_reserve(struct zone *zone)
 	unsigned long block_migratetype;
 	int reserve;
 	bool anyblock = false;
+	int old_reserve;
+	int new_reserve;
 
 retry:
 	/* Get the start pfn, end pfn and the number of blocks to reserve */
@@ -3363,7 +3365,12 @@ retry:
 	 * is assumed to be in place to help anti-fragmentation for the
 	 * future allocation of hugepages at runtime.
 	 */
-	reserve = min(2, reserve);
+	reserve = new_reserve = min(2, reserve);
+	old_reserve = zone->nr_migrate_reserve_block;
+
+	/* When memory hot-add, we almost always need to do nothing */
+	if (reserve == old_reserve)
+		return;
 
 	for (pfn = start_pfn; pfn < end_pfn; pfn += pageblock_nr_pages) {
 		if (!pfn_valid(pfn))
@@ -3394,6 +3401,14 @@ retry:
 				reserve--;
 				continue;
 			}
+		} else if (!old_reserve && !anyblock) {
+			/*
+			 * At boot time we don't need to scan the whole zone
+			 * for turning off MIGRATE_RESERVE.
+			 * Note: when anyblock is true, we can't exit a loop and
+			 * turn off MIGRATE_RESERVE which turn on pass-1.
+			 */
+			break;
 		}
 
 		/*
@@ -3417,6 +3432,8 @@ retry:
 		anyblock = true;
 		goto retry;
 	}
+
+	zone->nr_migrate_reserve_block = new_reserve;
 }
 
 /*
@@ -4986,6 +5003,7 @@ static int page_alloc_cpu_notify(struct notifier_block *self,
 	int cpu = (unsigned long)hcpu;
 
 	if (action == CPU_DEAD || action == CPU_DEAD_FROZEN) {
+		lru_add_drain_cpu(cpu);
 		drain_pages(cpu);
 
 		/*

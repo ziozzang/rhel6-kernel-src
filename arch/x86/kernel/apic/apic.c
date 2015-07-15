@@ -61,6 +61,7 @@ unsigned disabled_cpus __cpuinitdata;
 
 /* Processor that is doing the boot up */
 unsigned int boot_cpu_physical_apicid = -1U;
+EXPORT_SYMBOL_GPL(boot_cpu_physical_apicid);
 
 /*
  * The highest APIC ID seen during enumeration.
@@ -71,6 +72,13 @@ unsigned int max_physical_apicid;
  * Bitmask of physically existing CPUs:
  */
 physid_mask_t phys_cpu_present_map;
+
+/*
+ * Processor to be disabled specified by kernel parameter
+ * disable_cpu_apicid=<int>, mostly used for the kdump 2nd kernel to
+ * avoid undefined behaviour caused by sending INIT from AP to BSP.
+ */
+static unsigned int disabled_cpu_apicid __read_mostly = BAD_APICID;
 
 /*
  * Map cpu index to physical APIC ID
@@ -178,7 +186,7 @@ static struct resource lapic_resource = {
 	.flags = IORESOURCE_MEM | IORESOURCE_BUSY,
 };
 
-static unsigned int calibration_result;
+unsigned int lapic_timer_frequency = 0;
 
 static int lapic_next_event(unsigned long delta,
 			    struct clock_event_device *evt);
@@ -287,8 +295,12 @@ u32 native_safe_apic_wait_icr_idle(void)
 
 void native_apic_icr_write(u32 low, u32 id)
 {
+	unsigned long flags;
+
+	local_irq_save(flags);
 	apic_write(APIC_ICR2, SET_APIC_DEST_FIELD(id));
 	apic_write(APIC_ICR, low);
+	local_irq_restore(flags);
 }
 
 u64 native_apic_icr_read(void)
@@ -499,7 +511,7 @@ static void lapic_timer_setup(enum clock_event_mode mode,
 	switch (mode) {
 	case CLOCK_EVT_MODE_PERIODIC:
 	case CLOCK_EVT_MODE_ONESHOT:
-		__setup_APIC_LVTT(calibration_result,
+		__setup_APIC_LVTT(lapic_timer_frequency,
 				  mode != CLOCK_EVT_MODE_PERIODIC, 1);
 		break;
 	case CLOCK_EVT_MODE_UNUSED:
@@ -666,6 +678,25 @@ static int __init calibrate_APIC_clock(void)
 	long delta, deltatsc;
 	int pm_referenced = 0;
 
+	/**
+	 * check if lapic timer has already been calibrated by platform
+	 * specific routine, such as tsc calibration code. if so, we just fill
+	 * in the clockevent structure and return.
+	 */
+
+	if (lapic_timer_frequency) {
+		apic_printk(APIC_VERBOSE, "lapic timer already calibrated %d\n",
+				lapic_timer_frequency);
+		lapic_clockevent.mult = div_sc(lapic_timer_frequency/APIC_DIVISOR,
+					TICK_NSEC, lapic_clockevent.shift);
+		lapic_clockevent.max_delta_ns =
+			clockevent_delta2ns(0x7FFFFF, &lapic_clockevent);
+		lapic_clockevent.min_delta_ns =
+			clockevent_delta2ns(0xF, &lapic_clockevent);
+		lapic_clockevent.features &= ~CLOCK_EVT_FEAT_DUMMY;
+		return 0;
+	}
+
 	local_irq_disable();
 
 	/* Replace the global interrupt handler */
@@ -707,12 +738,12 @@ static int __init calibrate_APIC_clock(void)
 	lapic_clockevent.min_delta_ns =
 		clockevent_delta2ns(0xF, &lapic_clockevent);
 
-	calibration_result = (delta * APIC_DIVISOR) / LAPIC_CAL_LOOPS;
+	lapic_timer_frequency = (delta * APIC_DIVISOR) / LAPIC_CAL_LOOPS;
 
 	apic_printk(APIC_VERBOSE, "..... delta %ld\n", delta);
 	apic_printk(APIC_VERBOSE, "..... mult: %ld\n", lapic_clockevent.mult);
 	apic_printk(APIC_VERBOSE, "..... calibration result: %u\n",
-		    calibration_result);
+		    lapic_timer_frequency);
 
 	if (cpu_has_tsc) {
 		apic_printk(APIC_VERBOSE, "..... CPU clock speed is "
@@ -723,13 +754,13 @@ static int __init calibrate_APIC_clock(void)
 
 	apic_printk(APIC_VERBOSE, "..... host bus clock speed is "
 		    "%u.%04u MHz.\n",
-		    calibration_result / (1000000 / HZ),
-		    calibration_result % (1000000 / HZ));
+		    lapic_timer_frequency / (1000000 / HZ),
+		    lapic_timer_frequency % (1000000 / HZ));
 
 	/*
 	 * Do a sanity check on the APIC calibration result
 	 */
-	if (calibration_result < (1000000 / HZ)) {
+	if (lapic_timer_frequency < (1000000 / HZ)) {
 		local_irq_enable();
 		pr_warning("APIC frequency too slow, disabling apic timer\n");
 		return -1;
@@ -1507,7 +1538,7 @@ void __init enable_IR_x2apic(void)
 	}
 
 	local_irq_save(flags);
-	mask_8259A();
+	legacy_pic->mask_all();
 	mask_IO_APIC_setup(ioapic_entries);
 
 	if (dmar_table_init_ret)
@@ -1543,7 +1574,7 @@ void __init enable_IR_x2apic(void)
 nox2apic:
 	if (ret < 0) /* IR enabling failed */
 		restore_IO_APIC_setup(ioapic_entries);
-	unmask_8259A();
+	legacy_pic->restore_mask();
 	local_irq_restore(flags);
 
 out:
@@ -1704,7 +1735,7 @@ void __init init_apic_mappings(void)
 		 * acpi lapic path already maps that address in
 		 * acpi_register_lapic_address()
 		 */
-		if (!acpi_lapic)
+		if (!acpi_lapic && !smp_found_config)
 			set_fixmap_nocache(FIX_APIC_BASE, apic_phys);
 
 		apic_printk(APIC_VERBOSE, "mapped APIC to %08lx (%08lx)\n",
@@ -2008,6 +2039,39 @@ void __cpuinit generic_processor_info(int apicid, int version)
 				phys_cpu_present_map);
 
 	/*
+	 * boot_cpu_physical_apicid is designed to have the apicid
+	 * returned by read_apic_id(), i.e, the apicid of the
+	 * currently booting-up processor. However, on some platforms,
+	 * it is temporarily modified by the apicid reported as BSP
+	 * through MP table. Concretely:
+	 *
+	 * - arch/x86/kernel/mpparse.c: MP_processor_info()
+	 * - arch/x86/mm/amdtopology.c: amd_numa_init()
+	 * - arch/x86/platform/visws/visws_quirks.c: MP_processor_info()
+	 *
+	 * This function is executed with the modified
+	 * boot_cpu_physical_apicid. So, disabled_cpu_apicid kernel
+	 * parameter doesn't work to disable APs on kdump 2nd kernel.
+	 *
+	 * Since fixing handling of boot_cpu_physical_apicid requires
+	 * another discussion and tests on each platform, we leave it
+	 * for now and here we use read_apic_id() directly in this
+	 * function, generic_processor_info().
+	 */
+	if (disabled_cpu_apicid != BAD_APICID &&
+	    disabled_cpu_apicid != read_apic_id() &&
+	    disabled_cpu_apicid == apicid) {
+		int thiscpu = num_processors + disabled_cpus;
+
+		pr_warning("APIC: Disabling requested cpu."
+			   " Processor %d/0x%x ignored.\n",
+			   thiscpu, apicid);
+
+		disabled_cpus++;
+		return ;
+	}
+
+	/*
 	 * If boot cpu has not been detected yet, then only allow upto
 	 * nr_cpu_ids - 1 processors and keep one slot free for boot cpu
 	 */
@@ -2213,7 +2277,7 @@ static int lapic_resume(struct sys_device *dev)
 		}
 
 		mask_IO_APIC_setup(ioapic_entries);
-		mask_8259A();
+		legacy_pic->mask_all();
 	}
 
 	if (x2apic_mode)
@@ -2257,7 +2321,7 @@ static int lapic_resume(struct sys_device *dev)
 
 	if (intr_remapping_enabled) {
 		reenable_intr_remapping(x2apic_mode);
-		unmask_8259A();
+		legacy_pic->restore_mask();
 		restore_IO_APIC_setup(ioapic_entries);
 		free_ioapic_entries(ioapic_entries);
 	}
@@ -2500,3 +2564,12 @@ static int __init lapic_insert_resource(void)
  * that is using request_resource
  */
 late_initcall(lapic_insert_resource);
+
+static int __init apic_set_disabled_cpu_apicid(char *arg)
+{
+	if (!arg || !get_option(&arg, &disabled_cpu_apicid))
+		return -EINVAL;
+
+	return 0;
+}
+early_param("disable_cpu_apicid", apic_set_disabled_cpu_apicid);

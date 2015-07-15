@@ -44,6 +44,7 @@
 #include <linux/bitops.h>
 #include <linux/spinlock.h>
 #include <linux/srcu.h>
+#include <linux/hugetlb.h>
 
 #include <asm/processor.h>
 #include <asm/io.h>
@@ -676,7 +677,8 @@ static int kvm_vm_ioctl_assign_device(struct kvm *kvm,
 		r = -ENOMEM;
 		goto out;
 	}
-	dev = pci_get_bus_and_slot(assigned_dev->busnr,
+	dev = pci_get_domain_bus_and_slot(assigned_dev->segnr,
+				   assigned_dev->busnr,
 				   assigned_dev->devfn);
 	if (!dev) {
 		printk(KERN_INFO "%s: host device not found\n", __func__);
@@ -709,6 +711,7 @@ static int kvm_vm_ioctl_assign_device(struct kvm *kvm,
 	pci_reset_function(dev);
 
 	match->assigned_dev_id = assigned_dev->assigned_dev_id;
+	match->host_segnr = assigned_dev->segnr;
 	match->host_busnr = assigned_dev->busnr;
 	match->host_devfn = assigned_dev->devfn;
 	match->flags = assigned_dev->flags;
@@ -1644,6 +1647,41 @@ int kvm_is_visible_gfn(struct kvm *kvm, gfn_t gfn)
 }
 EXPORT_SYMBOL_GPL(kvm_is_visible_gfn);
 
+unsigned long kvm_host_page_size(struct kvm *kvm, gfn_t gfn)
+{
+	struct vm_area_struct *vma;
+	unsigned long addr;
+	unsigned long page_size;
+
+	page_size = PAGE_SIZE;
+
+	addr = gfn_to_hva(kvm, gfn);
+	if (kvm_is_error_hva(addr))
+		return PAGE_SIZE;
+
+	down_read(&current->mm->mmap_sem);
+	vma = find_vma(current->mm, addr);
+	if (!vma)
+		goto out;
+
+	page_size = vma_kernel_pagesize(vma);
+
+out:
+	up_read(&current->mm->mmap_sem);
+
+	/* check for transparent hugepages */
+	if (page_size == PAGE_SIZE) {
+		pfn_t pfn = hva_to_pfn(kvm, addr);
+
+		if (!is_error_pfn(pfn) && !kvm_is_mmio_pfn(pfn) &&
+		    PageTransCompound(pfn_to_page(pfn)))
+			page_size = KVM_HPAGE_SIZE(2);
+		kvm_release_pfn_clean(pfn);
+	}
+
+	return page_size;
+}
+
 int memslot_id(struct kvm *kvm, gfn_t gfn)
 {
 	int i;
@@ -2288,6 +2326,10 @@ static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, u32 id)
 	int r;
 	struct kvm_vcpu *vcpu, *v;
 
+	/* vcpu_id cannot exceed the max apic ID */
+	if (id >= KVM_MAX_VCPU_ID)
+		return -EINVAL;
+
 	vcpu = kvm_arch_vcpu_create(kvm, id);
 	if (IS_ERR(vcpu))
 		return PTR_ERR(vcpu);
@@ -2303,7 +2345,7 @@ static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, u32 id)
 		r = -EINVAL;
 		goto vcpu_destroy;
 	}
-	if (atomic_read(&kvm->online_vcpus) == KVM_MAX_VCPUS) {
+	if (atomic_read(&kvm->online_vcpus) == KVM_MAX_VCPU_COUNT) {
 		r = -EINVAL;
 		goto vcpu_destroy;
 	}
@@ -3304,6 +3346,8 @@ static void kvm_sched_in(struct preempt_notifier *pn, int cpu)
 	struct kvm_vcpu *vcpu = preempt_notifier_to_vcpu(pn);
 	if (vcpu->preempted)
 		vcpu->preempted = false;
+
+	kvm_arch_sched_in(vcpu, cpu);
 
 	kvm_arch_vcpu_load(vcpu, cpu);
 }

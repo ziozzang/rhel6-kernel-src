@@ -137,6 +137,8 @@
 #include <net/tcp.h>
 #endif
 
+#include <net/busy_poll.h>
+
 /*
  * Each address family might have different locking rules, so we have
  * one slock key per address family:
@@ -236,6 +238,17 @@ int net_prio_subsys_id = -1;
 EXPORT_SYMBOL_GPL(net_prio_subsys_id);
 #endif
 #endif
+
+static bool proto_has_rhel_ext(const struct proto *prot, int flag)
+{
+	return (prot->slab_flags & RHEL_EXTENDED_PROTO) &&
+	       (prot->rhel_flags & flag);
+}
+
+static int proto_slab_flags(const struct proto *prot)
+{
+	return prot->slab_flags & ~RHEL_EXTENDED_PROTO;
+}
 
 static int sock_set_timeout(long *timeo_p, char __user *optval, int optlen)
 {
@@ -742,6 +755,20 @@ set_rcvbuf:
 		else
 			sock_reset_flag(sk, SOCK_RXQ_OVFL);
 		break;
+
+#ifdef CONFIG_NET_RX_BUSY_POLL
+	case SO_BUSY_POLL:
+		/* allow unprivileged users to decrease the value */
+		if ((val > sk_extended(sk)->sk_ll_usec) && !capable(CAP_NET_ADMIN))
+			ret = -EPERM;
+		else {
+			if (val < 0)
+				ret = -EINVAL;
+			else
+				sk_extended(sk)->sk_ll_usec = val;
+		}
+		break;
+#endif
 	default:
 		ret = -ENOPROTOOPT;
 		break;
@@ -966,6 +993,16 @@ int sock_getsockopt(struct socket *sock, int level, int optname,
 	case SO_RXQ_OVFL:
 		v.val = !!sock_flag(sk, SOCK_RXQ_OVFL);
 		break;
+
+	case SO_BPF_EXTENSIONS:
+		v.val = bpf_tell_extensions();
+		break;
+
+#ifdef CONFIG_NET_RX_BUSY_POLL
+	case SO_BUSY_POLL:
+		v.val = sk_extended(sk)->sk_ll_usec;
+		break;
+#endif
 
 	default:
 		return -ENOPROTOOPT;
@@ -1989,6 +2026,10 @@ void sock_init_data(struct socket *sock, struct sock *sk)
 
 	sk->sk_stamp = ktime_set(-1L, 0);
 
+#ifdef CONFIG_NET_RX_BUSY_POLL
+	sk_extended(sk)->sk_napi_id =	0;
+	sk_extended(sk)->sk_ll_usec =	sysctl_net_busy_read;
+#endif
 	/*
 	 * Before updating sk_refcnt, we must commit prior changes to memory
 	 * (Documentation/RCU/rculist_nulls.txt for details)
@@ -2026,7 +2067,8 @@ void release_sock(struct sock *sk)
 	if (sk->sk_backlog.tail)
 		__release_sock(sk);
 
-	if (sk->sk_prot->release_cb)
+	if (proto_has_rhel_ext(sk->sk_prot, RHEL_PROTO_HAS_RELEASE_CB) &&
+	    sk->sk_prot->release_cb)
 		sk->sk_prot->release_cb(sk);
 
 	sk->sk_lock.owned = 0;
@@ -2302,7 +2344,7 @@ int proto_register(struct proto *prot, int alloc_slab)
 	if (alloc_slab) {
 		prot->slab = kmem_cache_create(prot->name,
 					sk_alloc_size(prot->obj_size), 0,
-					SLAB_HWCACHE_ALIGN | prot->slab_flags,
+					SLAB_HWCACHE_ALIGN | proto_slab_flags(prot),
 					NULL);
 
 		if (prot->slab == NULL) {
@@ -2344,7 +2386,7 @@ int proto_register(struct proto *prot, int alloc_slab)
 						  prot->twsk_prot->twsk_obj_size,
 						  0,
 						  SLAB_HWCACHE_ALIGN |
-							prot->slab_flags,
+							proto_slab_flags(prot),
 						  NULL);
 			if (prot->twsk_prot->twsk_slab == NULL)
 				goto out_free_timewait_sock_slab_name;

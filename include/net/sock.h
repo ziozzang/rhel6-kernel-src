@@ -310,6 +310,13 @@ struct sock {
 	void                    (*sk_destruct)(struct sock *sk);
 };
 
+struct inet_cork_extended {
+	__s16		tos;
+	__u8		ttl;
+	char		priority;
+	unsigned __rh_inet_cork_reserved[2];
+};
+
 /*
  * To prevent KABI-breakage, struct sock_extended is added here to extend
  * the original struct sock. Also two helpers are added:
@@ -317,6 +324,9 @@ struct sock {
  *     - is used to adjust prot->obj_size
  * sk_extended
  *     - should be used to access items in struct sock_extended
+ *
+ *	@sk_napi_id: id of the last napi context to receive data for sk
+ *	@sk_ll_usec: usecs to busypoll when there is no data
  */
 
 struct sock_extended {
@@ -363,6 +373,11 @@ struct sock_extended {
 	const struct cred	*sk_peer_cred;
 	u16			sk_gso_max_segs;
 	u32			sk_pacing_rate; /* bytes per second */
+	struct inet_cork_extended	inet_cork_ext;
+#ifdef CONFIG_NET_RX_BUSY_POLL
+	unsigned int		sk_napi_id;
+	unsigned int		sk_ll_usec;
+#endif
 };
 
 #define __sk_tx_queue_mapping(sk) \
@@ -724,6 +739,19 @@ struct timewait_sock_ops;
 struct inet_hashinfo;
 struct raw_hashinfo;
 
+/*
+ * RHEL HACK: Abuse slab_flags to indicate size extension of struct proto.
+ * If RHEL_EXTENDED_PROTO is set in .slab_flags, struct proto contains
+ * rhel_flags which specifies what additional members are provided by the
+ * protocol module. SLAB_DEBUG_FREE is reused due to being unused in this
+ * context. It is masked out and never passed into kmem_cache_create().
+ */
+#define RHEL_EXTENDED_PROTO	SLAB_DEBUG_FREE
+
+/* RHEL specific flags to signal presence of extended members */
+#define RHEL_PROTO_HAS_RELEASE_CB	1
+
+
 /* Networking protocol blocks we attach to sockets.
  * socket layer -> transport layer interface
  * transport -> network interface is defined by struct inet_proto
@@ -823,7 +851,14 @@ struct proto {
 	atomic_t		socks;
 #endif
 #ifndef __GENKSYMS__
+	/*
+	 * RHEL specific extended area, only valid if RHEL_EXTENDED_PROTO is
+	 * present in .slab_flags.
+	 */
 	void		(*release_cb)(struct sock *sk);
+	u32			rhel_flags;
+
+	/* Add additional members here and add a new RHEL_PROTO_ flag */
 #endif
 };
 

@@ -357,52 +357,6 @@ int gfs2_inode_refresh(struct gfs2_inode *ip)
 	return error;
 }
 
-/**
- * gfs2_change_nlink - Change nlink count on inode
- * @ip: The GFS2 inode
- * @diff: The change in the nlink count required
- *
- * Returns: errno
- */
-int gfs2_change_nlink(struct gfs2_inode *ip, int diff)
-{
-	struct buffer_head *dibh;
-	u32 nlink;
-	int error;
-
-	BUG_ON(diff != 1 && diff != -1);
-	nlink = ip->i_inode.i_nlink + diff;
-
-	/* If we are reducing the nlink count, but the new value ends up being
-	   bigger than the old one, we must have underflowed. */
-	if (diff < 0 && nlink > ip->i_inode.i_nlink) {
-		if (gfs2_consist_inode(ip))
-			gfs2_dinode_print(ip);
-		return -EIO;
-	}
-
-	error = gfs2_meta_inode_buffer(ip, &dibh);
-	if (error)
-		return error;
-
-	if (diff > 0)
-		inc_nlink(&ip->i_inode);
-	else
-		drop_nlink(&ip->i_inode);
-
-	ip->i_inode.i_ctime = CURRENT_TIME;
-
-	gfs2_trans_add_meta(ip->i_gl, dibh);
-	gfs2_dinode_out(ip, dibh->b_data);
-	brelse(dibh);
-	mark_inode_dirty(&ip->i_inode);
-
-	if (ip->i_inode.i_nlink == 0)
-		gfs2_unlink_di(&ip->i_inode); /* mark inode unlinked */
-
-	return error;
-}
-
 struct inode *gfs2_lookup_simple(struct inode *dip, const char *name)
 {
 	struct qstr qstr;
@@ -545,6 +499,7 @@ static void munge_mode_uid_gid(const struct gfs2_inode *dip,
 static int alloc_dinode(struct gfs2_inode *ip, u32 flags)
 {
 	struct gfs2_sbd *sdp = GFS2_SB(&ip->i_inode);
+	struct gfs2_alloc_parms ap = { .target = RES_DINODE, .aflags = flags, };
 	int error;
 	int dblocks = 1;
 
@@ -552,7 +507,7 @@ static int alloc_dinode(struct gfs2_inode *ip, u32 flags)
 	if (error)
 		goto out;
 
-	error = gfs2_inplace_reserve(ip, RES_DINODE, flags);
+	error = gfs2_inplace_reserve(ip, &ap);
 	if (error)
 		goto out_quota;
 
@@ -672,6 +627,7 @@ static int link_dinode(struct gfs2_inode *dip, const struct qstr *name,
 {
 	struct gfs2_sbd *sdp = GFS2_SB(&dip->i_inode);
 	struct buffer_head *dibh;
+	struct gfs2_alloc_parms ap = { .target = sdp->sd_max_dirres, };
 	int error;
 
 	error = gfs2_quota_lock(dip, NO_QUOTA_CHANGE, NO_QUOTA_CHANGE);
@@ -683,7 +639,7 @@ static int link_dinode(struct gfs2_inode *dip, const struct qstr *name,
 		if (error)
 			goto fail_quota_locks;
 
-		error = gfs2_inplace_reserve(dip, sdp->sd_max_dirres, 0);
+		error = gfs2_inplace_reserve(dip, &ap);
 		if (error)
 			goto fail_quota_locks;
 
@@ -699,7 +655,7 @@ static int link_dinode(struct gfs2_inode *dip, const struct qstr *name,
 			goto fail_quota_locks;
 	}
 
-	error = gfs2_dir_add(&dip->i_inode, name, ip, IF2DT(ip->i_inode.i_mode));
+	error = gfs2_dir_add(&dip->i_inode, name, ip);
 	if (error)
 		goto fail_end_trans;
 
@@ -766,7 +722,7 @@ int gfs2_create_inode(struct inode *dir, struct dentry *dentry,
 	struct gfs2_inode *dip = GFS2_I(dir), *ip;
 	struct gfs2_sbd *sdp = GFS2_SB(&dip->i_inode);
 	struct gfs2_glock *io_gl;
-	int error;
+	int error, free_vfs_inode = 0;
 	struct buffer_head *bh = NULL;
 	u32 aflags = 0;
 	int arq;
@@ -902,12 +858,12 @@ fail_free_inode:
 	if (ip->i_gl)
 		gfs2_glock_put(ip->i_gl);
 	gfs2_rs_delete(ip);
-	inode->i_sb->s_op->destroy_inode(inode);
-	inode = NULL;
+	free_vfs_inode = 1;
 fail_gunlock:
 	gfs2_glock_dq_uninit(ghs);
 	if (inode && !IS_ERR(inode)) {
-		set_bit(GIF_ALLOC_FAILED, &GFS2_I(inode)->i_flags);
+		set_bit(free_vfs_inode ? GIF_FREE_VFS_INODE : GIF_ALLOC_FAILED,
+			&GFS2_I(inode)->i_flags);
 		iput(inode);
 	}
 fail:

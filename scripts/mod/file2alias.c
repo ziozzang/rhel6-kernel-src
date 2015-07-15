@@ -211,10 +211,13 @@ static int do_hid_entry(const char *filename,
 			     struct hid_device_id *id, char *alias)
 {
 	id->bus = TO_NATIVE(id->bus);
+	id->group = TO_NATIVE(id->group);
 	id->vendor = TO_NATIVE(id->vendor);
 	id->product = TO_NATIVE(id->product);
 
-	sprintf(alias, "hid:b%04X", id->bus);
+	sprintf(alias, "hid:");
+	ADD(alias, "b", id->bus != HID_BUS_ANY, id->bus);
+	ADD(alias, "g", id->group != HID_GROUP_ANY, id->group);
 	ADD(alias, "v", id->vendor != HID_ANY_ID, id->vendor);
 	ADD(alias, "p", id->product != HID_ANY_ID, id->product);
 
@@ -633,6 +636,24 @@ static int do_ssb_entry(const char *filename,
 	return 1;
 }
 
+/* Looks like: bcma:mNidNrevNclN. */
+static int do_bcma_entry(const char *filename,
+			 struct bcma_device_id *id, char *alias)
+{
+	id->manuf = TO_NATIVE(id->manuf);
+	id->id = TO_NATIVE(id->id);
+	id->rev = TO_NATIVE(id->rev);
+	id->class = TO_NATIVE(id->class);
+
+	strcpy(alias, "bcma:");
+	ADD(alias, "m", id->manuf != BCMA_ANY_MANUF, id->manuf);
+	ADD(alias, "id", id->id != BCMA_ANY_ID, id->id);
+	ADD(alias, "rev", id->rev != BCMA_ANY_REV, id->rev);
+	ADD(alias, "cl", id->class != BCMA_ANY_CLASS, id->class);
+	add_wildcard(alias);
+	return 1;
+}
+
 /* Looks like: virtio:dNvN */
 static int do_virtio_entry(const char *filename, struct virtio_device_id *id,
 			   char *alias)
@@ -726,8 +747,8 @@ static int do_dmi_entry(const char *filename, struct dmi_system_id *id,
 
 	for (i = 0; i < ARRAY_SIZE(dmi_fields); i++) {
 		for (j = 0; j < 4; j++) {
-			if (id->matches[j].slot &&
-			    id->matches[j].slot == dmi_fields[i].field) {
+			int s = dmi_strmatch_slot(&id->matches[j]);
+			if (s && s == dmi_fields[i].field) {
 				sprintf(alias + strlen(alias), ":%s*",
 					dmi_fields[i].prefix);
 				dmi_ascii_filter(alias + strlen(alias),
@@ -920,6 +941,10 @@ void handle_moddevtable(struct module *mod, struct elf_info *info,
 		do_table(symval, sym->st_size,
 			 sizeof(struct ssb_device_id), "ssb",
 			 do_ssb_entry, mod);
+	else if (sym_is(symname, "__mod_bcma_device_table"))
+		do_table(symval, sym->st_size,
+			 sizeof(struct bcma_device_id), "bcma",
+			 do_bcma_entry, mod);
 	else if (sym_is(symname, "__mod_virtio_device_table"))
 		do_table(symval, sym->st_size,
 			 sizeof(struct virtio_device_id), "virtio",

@@ -370,6 +370,9 @@ static inline struct task_group *task_group(struct task_struct *p)
 {
 	struct task_group *tg;
 
+	if (p->flags & PF_EXITING)
+		return &root_task_group;
+
 #ifdef CONFIG_USER_SCHED
 	rcu_read_lock();
 	tg = __task_cred(p)->user->tg;
@@ -387,14 +390,18 @@ static inline struct task_group *task_group(struct task_struct *p)
 /* Change a task's cfs_rq and parent entity if it moves across CPUs/groups */
 static inline void set_task_rq(struct task_struct *p, unsigned int cpu)
 {
+#if defined(CONFIG_FAIR_GROUP_SCHED) || defined(CONFIG_RT_GROUP_SCHED)
+	struct task_group *tg = task_group(p);
+#endif
+
 #ifdef CONFIG_FAIR_GROUP_SCHED
-	p->se.cfs_rq = task_group(p)->cfs_rq[cpu];
-	p->se.parent = task_group(p)->se[cpu];
+	p->se.cfs_rq = tg->cfs_rq[cpu];
+	p->se.parent = tg->se[cpu];
 #endif
 
 #ifdef CONFIG_RT_GROUP_SCHED
-	p->rt.rt_rq  = task_group(p)->rt_rq[cpu];
-	p->rt.parent = task_group(p)->rt_se[cpu];
+	p->rt.rt_rq  = tg->rt_rq[cpu];
+	p->rt.parent = tg->rt_se[cpu];
 #endif
 }
 
@@ -763,6 +770,11 @@ struct rq {
 	u64 age_stamp;
 	u64 idle_stamp;
 	u64 avg_idle;
+
+#ifndef __GENKSYMS__
+	/* This is used to determine avg_idle's max value */
+	u64 max_idle_balance_cost;
+#endif
 #endif
 
 #ifndef __GENKSYMS__
@@ -2657,12 +2669,13 @@ out_running:
 
 	if (unlikely(rq->idle_stamp)) {
 		u64 delta = rq->clock - rq->idle_stamp;
-		u64 max = 2*sysctl_sched_migration_cost;
+		u64 max = 2*rq->max_idle_balance_cost;
 
-		if (delta > max)
+		update_avg(&rq->avg_idle, delta);
+
+		if (rq->avg_idle > max)
 			rq->avg_idle = max;
-		else
-			update_avg(&rq->avg_idle, delta);
+
 		rq->idle_stamp = 0;
 	}
 #endif
@@ -4882,6 +4895,7 @@ static void idle_balance(int this_cpu, struct rq *this_rq)
 	struct sched_domain *sd;
 	int pulled_task = 0;
 	unsigned long next_balance = jiffies + HZ;
+	u64 curr_cost = 0;
 
 	this_rq->idle_stamp = this_rq->clock;
 
@@ -4894,14 +4908,28 @@ static void idle_balance(int this_cpu, struct rq *this_rq)
 
 	for_each_domain(this_cpu, sd) {
 		unsigned long interval;
+		u64 t0, domain_cost;
 
 		if (!(sd->flags & SD_LOAD_BALANCE))
 			continue;
 
-		if (sd->flags & SD_BALANCE_NEWIDLE)
+		if (this_rq->avg_idle < curr_cost + sd->max_newidle_lb_cost)
+			break;
+
+		if (sd->flags & SD_BALANCE_NEWIDLE) {
+			t0 = sched_clock_cpu(this_cpu);
+
 			/* If we've pulled tasks over stop searching: */
 			pulled_task = load_balance_newidle(this_cpu, this_rq,
 							   sd);
+
+			domain_cost = sched_clock_cpu(this_cpu) - t0;
+			if (domain_cost > sd->max_newidle_lb_cost)
+				sd->max_newidle_lb_cost = domain_cost;
+
+			curr_cost += domain_cost;
+		}
+
 
 		interval = msecs_to_jiffies(sd->balance_interval);
 		if (time_after(next_balance, sd->last_balance + interval))
@@ -4918,6 +4946,9 @@ static void idle_balance(int this_cpu, struct rq *this_rq)
 		 */
 		this_rq->next_balance = next_balance;
 	}
+
+	if (curr_cost > this_rq->max_idle_balance_cost)
+		this_rq->max_idle_balance_cost = curr_cost;
 }
 
 /*
@@ -5236,13 +5267,37 @@ static void rebalance_domains(int cpu, enum cpu_idle_type idle)
 	/* Earliest time when we have to do rebalance again */
 	unsigned long next_balance = jiffies + 60*HZ;
 	int update_next_balance = 0;
-	int need_serialize;
+	int need_serialize, need_decay = 0;
+	u64 max_cost = 0;
 
 	update_shares(cpu);
 
 	for_each_domain(cpu, sd) {
+		/*
+		 * Decay the newidle max times here because this is a regular
+		 * visit to all the domains. Decay ~1% per second.
+		 */
+		if (time_after(jiffies, sd->next_decay_max_lb_cost)) {
+			sd->max_newidle_lb_cost =
+				(sd->max_newidle_lb_cost * 253) / 256;
+			sd->next_decay_max_lb_cost = jiffies + HZ;
+			need_decay = 1;
+		}
+		max_cost += sd->max_newidle_lb_cost;
+
 		if (!(sd->flags & SD_LOAD_BALANCE))
 			continue;
+
+		/*
+		 * Stop the load balance at this level. There is another
+		 * CPU in our sched group which is doing load balancing more
+		 * actively.
+		 */
+		if (!balance) {
+			if (need_decay)
+				continue;
+			break;
+		}
 
 		interval = sd->balance_interval;
 		if (idle != CPU_IDLE)
@@ -5280,14 +5335,14 @@ out:
 			next_balance = sd->last_balance + interval;
 			update_next_balance = 1;
 		}
-
+	}
+	if (need_decay) {
 		/*
-		 * Stop the load balance at this level. There is another
-		 * CPU in our sched group which is doing load balancing more
-		 * actively.
+		 * Ensure the rq-side value also decays but keep it at a
+		 * reasonable floor to avoid funnies with rq->avg_idle.
 		 */
-		if (!balance)
-			break;
+		rq->max_idle_balance_cost =
+			max((u64)sysctl_sched_migration_cost, max_cost);
 	}
 
 	/*
@@ -8429,6 +8484,7 @@ migration_call(struct notifier_block *nfb, unsigned long action, void *hcpu)
 		break;
 
 	case CPU_POST_DEAD:
+	case CPU_POST_DEAD_FROZEN:
 		/*
 		 * Bring the migration thread down in CPU_POST_DEAD event,
 		 * since the timers should have got migrated by now and thus
@@ -9176,6 +9232,9 @@ static void init_numa_sched_groups_power(struct sched_group *group_head)
 	if (!sg)
 		return;
 	do {
+		/* Estimate the final value to avoid /0 on weird topologies. */
+		sg->cpu_power = SCHED_LOAD_SCALE * cpumask_weight(
+		                    sched_group_cpus(sg));
 		for_each_cpu(j, sched_group_cpus(sg)) {
 			struct sched_domain *sd;
 
@@ -9189,6 +9248,9 @@ static void init_numa_sched_groups_power(struct sched_group *group_head)
 			}
 
 			sg->cpu_power += sd->groups->cpu_power;
+			/* Discharge initial estimate of updated cpus. */
+			sg->cpu_power -= SCHED_LOAD_SCALE * cpumask_weight(
+			                     sched_group_cpus(sd->groups));
 		}
 		sg = sg->next;
 	} while (sg != group_head);
@@ -10421,6 +10483,7 @@ void __init sched_init(void)
 		rq->migration_thread = NULL;
 		rq->idle_stamp = 0;
 		rq->avg_idle = 2*sysctl_sched_migration_cost;
+		rq->max_idle_balance_cost = sysctl_sched_migration_cost;
 		INIT_LIST_HEAD(&rq->migration_queue);
 		rq_attach_root(rq, &def_root_domain);
 #ifdef CONFIG_NO_HZ
@@ -11302,6 +11365,21 @@ cpu_cgroup_attach_task(struct cgroup *cgrp, struct task_struct *tsk)
 	sched_move_task(tsk);
 }
 
+static void
+cpu_cgroup_exit(struct cgroup_subsys *ss, struct cgroup *cgrp,
+		struct cgroup *old_cgrp, struct task_struct *task)
+{
+	/*
+	 * cgroup_exit() is called in the copy_process() failure path.
+	 * Ignore this case since the task hasn't ran yet, this avoids
+	 * trying to poke a half freed task state from generic code.
+	 */
+	if (!(task->flags & PF_EXITING))
+		return;
+
+	sched_move_task(task);
+}
+
 #ifdef CONFIG_FAIR_GROUP_SCHED
 static int cpu_shares_write_u64(struct cgroup *cgrp, struct cftype *cftype,
 				u64 shareval)
@@ -11622,6 +11700,7 @@ struct cgroup_subsys cpu_cgroup_subsys = {
 	.destroy	= cpu_cgroup_destroy,
 	.can_attach_task = cpu_cgroup_can_attach_task,
 	.attach_task	= cpu_cgroup_attach_task,
+	.exit           = cpu_cgroup_exit,
 	.populate	= cpu_cgroup_populate,
 	.subsys_id	= cpu_cgroup_subsys_id,
 	.early_init	= 1,

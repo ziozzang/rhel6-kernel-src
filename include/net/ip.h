@@ -28,6 +28,9 @@
 #include <linux/skbuff.h>
 
 #include <net/inet_sock.h>
+#ifndef __GENKSYMS__
+#include <net/route.h>
+#endif
 #include <net/snmp.h>
 #include <net/flow.h>
 
@@ -43,6 +46,8 @@ struct inet_skb_parm
 #define IPSKB_XFRM_TRANSFORMED	4
 #define IPSKB_FRAG_COMPLETE	8
 #define IPSKB_REROUTED		16
+
+	u16			frag_max_size;
 };
 
 static inline unsigned int ip_hdrlen(const struct sk_buff *skb)
@@ -56,6 +61,9 @@ struct ipcm_cookie
 	int			oif;
 	struct ip_options	*opt;
 	union skb_shared_tx	shtx;
+	__u8			ttl;
+	__s16			tos;
+	char			priority;
 };
 
 #define IPCB(skb) ((struct inet_skb_parm*)((skb)->cb))
@@ -84,6 +92,7 @@ struct packet_type;
 struct rtable;
 struct sockaddr;
 struct inet_cork;
+struct inet_cork_extended;
 
 extern int		igmp_mc_proc_init(void);
 
@@ -119,7 +128,8 @@ extern ssize_t		ip_append_page(struct sock *sk, struct page *page,
 				int offset, size_t size, int flags);
 extern struct sk_buff  *__ip_make_skb(struct sock *sk,
 				      struct sk_buff_head *queue,
-				      struct inet_cork *cork);
+				      struct inet_cork *cork,
+				      struct inet_cork_extended *cork_ext);
 extern int		ip_send_skb(struct sk_buff *skb);
 extern int		ip_push_pending_frames(struct sock *sk);
 extern void		ip_flush_pending_frames(struct sock *sk);
@@ -134,7 +144,18 @@ extern struct sk_buff  *ip_make_skb(struct sock *sk,
 static inline struct sk_buff *ip_finish_skb(struct sock *sk)
 {
 	return __ip_make_skb(sk, &sk->sk_write_queue,
-			     (struct inet_cork *)&inet_sk(sk)->cork);
+			     (struct inet_cork *)&inet_sk(sk)->cork,
+			     &sk_extended(sk)->inet_cork_ext);
+}
+
+static inline __u8 get_rttos(struct ipcm_cookie* ipc, struct inet_sock *inet)
+{
+	return (ipc->tos != -1) ? RT_TOS(ipc->tos) : RT_TOS(inet->tos);
+}
+
+static inline __u8 get_rtconn_flags(struct ipcm_cookie* ipc, struct sock* sk)
+{
+	return (ipc->tos != -1) ? RT_CONN_FLAGS_TOS(sk, ipc->tos) : RT_CONN_FLAGS(sk);
 }
 
 /* datagram.c */
@@ -414,7 +435,7 @@ extern int	compat_ip_getsockopt(struct sock *sk, int level,
 			int optname, char __user *optval, int __user *optlen);
 extern int	ip_ra_control(struct sock *sk, unsigned char on, void (*destructor)(struct sock *));
 
-extern int 	ip_recv_error(struct sock *sk, struct msghdr *msg, int len);
+extern int 	ip_recv_error(struct sock *sk, struct msghdr *msg, int len, int *addr_len);
 extern void	ip_icmp_error(struct sock *sk, struct sk_buff *skb, int err, 
 			      __be16 port, u32 info, u8 *payload);
 extern void	ip_local_error(struct sock *sk, int err, __be32 daddr, __be16 dport,

@@ -24,6 +24,7 @@
 #include <asm/uaccess.h>
 #include <linux/dlm.h>
 #include <linux/dlm_plock.h>
+#include <linux/delay.h>
 
 #include "gfs2.h"
 #include "incore.h"
@@ -354,6 +355,7 @@ static int gfs2_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
 	struct inode *inode = vma->vm_file->f_path.dentry->d_inode;
 	struct gfs2_inode *ip = GFS2_I(inode);
 	struct gfs2_sbd *sdp = GFS2_SB(inode);
+	struct gfs2_alloc_parms ap = { .aflags = 0, };
 	unsigned long last_index;
 	u64 pos = page->index << PAGE_CACHE_SHIFT;
 	unsigned int data_blocks, ind_blocks, rblocks;
@@ -406,7 +408,8 @@ static int gfs2_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
 	if (ret)
 		goto out_unlock;
 	gfs2_write_calc_reserv(ip, PAGE_CACHE_SIZE, &data_blocks, &ind_blocks);
-	ret = gfs2_inplace_reserve(ip, data_blocks + ind_blocks, 0);
+	ap.target = data_blocks + ind_blocks;
+	ret = gfs2_inplace_reserve(ip, &ap);
 	if (ret)
 		goto out_quota_unlock;
 
@@ -723,9 +726,10 @@ static int do_flock(struct file *file, int cmd, struct file_lock *fl)
 	unsigned int state;
 	int flags;
 	int error = 0;
+	int sleeptime;
 
 	state = (fl->fl_type == F_WRLCK) ? LM_ST_EXCLUSIVE : LM_ST_SHARED;
-	flags = (IS_SETLKW(cmd) ? 0 : LM_FLAG_TRY) | GL_EXACT | GL_NOCACHE;
+	flags = (IS_SETLKW(cmd) ? 0 : LM_FLAG_TRY_1CB) | GL_EXACT;
 
 	mutex_lock(&fp->f_fl_mutex);
 
@@ -735,7 +739,7 @@ static int do_flock(struct file *file, int cmd, struct file_lock *fl)
 			goto out;
 		flock_lock_file_wait(file,
 				     &(struct file_lock){.fl_type = F_UNLCK});
-		gfs2_glock_dq_wait(fl_gh);
+		gfs2_glock_dq(fl_gh);
 		gfs2_holder_reinit(state, flags, fl_gh);
 	} else {
 		error = gfs2_glock_get(GFS2_SB(&ip->i_inode), ip->i_no_addr,
@@ -745,7 +749,14 @@ static int do_flock(struct file *file, int cmd, struct file_lock *fl)
 		gfs2_holder_init(gl, state, flags, fl_gh);
 		gfs2_glock_put(gl);
 	}
-	error = gfs2_glock_nq(fl_gh);
+	for (sleeptime = 1; sleeptime <= 4; sleeptime <<= 1) {
+		error = gfs2_glock_nq(fl_gh);
+		if (error != GLR_TRYFAILED)
+			break;
+		fl_gh->gh_flags = LM_FLAG_TRY | GL_EXACT;
+		fl_gh->gh_error = 0;
+		msleep(sleeptime);
+	}
 	if (error) {
 		gfs2_holder_uninit(fl_gh);
 		if (error == GLR_TRYFAILED)
@@ -768,7 +779,7 @@ static void do_unflock(struct file *file, struct file_lock *fl)
 	mutex_lock(&fp->f_fl_mutex);
 	flock_lock_file_wait(file, fl);
 	if (fl_gh->gh_gl) {
-		gfs2_glock_dq_wait(fl_gh);
+		gfs2_glock_dq(fl_gh);
 		gfs2_holder_uninit(fl_gh);
 	}
 	mutex_unlock(&fp->f_fl_mutex);

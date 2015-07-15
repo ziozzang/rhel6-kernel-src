@@ -132,7 +132,7 @@ struct mem_cgroup_zone {
  * From 0 .. 100.  Higher means more swappy.
  */
 int vm_swappiness = 60;
-long vm_total_pages;	/* The total number of pages which the VM controls */
+unsigned long vm_total_pages;	/* The total number of pages which the VM controls */
 
 static LIST_HEAD(shrinker_list);
 static DECLARE_RWSEM(shrinker_rwsem);
@@ -704,17 +704,41 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 			(PageSwapCache(page) && (sc->gfp_mask & __GFP_IO));
 
 		if (PageWriteback(page)) {
-			nr_writeback++;
 			/*
-			 * Synchronous reclaim cannot queue pages for
-			 * writeback due to the possibility of stack overflow
-			 * but if it encounters a page under writeback, wait
-			 * for the IO to complete.
+			 * memcg doesn't have any dirty pages throttling so we
+			 * could easily OOM just because too many pages are in
+			 * writeback and there is nothing else to reclaim.
+			 *
+			 * Check __GFP_IO, certainly because a loop driver
+			 * thread might enter reclaim, and deadlock if it waits
+			 * on a page for which it is needed to do the write
+			 * (loop masks off __GFP_IO|__GFP_FS for this reason);
+			 * but more thought would probably show more reasons.
+			 *
+			 * Don't require __GFP_FS, since we're not going into
+			 * the FS, just waiting on its writeback completion.
+			 * Worryingly, ext4 gfs2 and xfs allocate pages with
+			 * grab_cache_page_write_begin(,,AOP_FLAG_NOFS), so
+			 * testing may_enter_fs here is liable to OOM on them.
 			 */
-			if (sync_writeback == PAGEOUT_IO_SYNC && may_enter_fs)
-				wait_on_page_writeback(page);
-			else
+			if (global_reclaim(sc) ||
+			    !PageReclaim(page) || !(sc->gfp_mask & __GFP_IO)) {
+				/*
+				 * This is slightly racy - end_page_writeback()
+				 * might have just cleared PageReclaim, then
+				 * setting PageReclaim here end up interpreted
+				 * as PageReadahead - but that does not matter
+				 * enough to care.  What we do want is for this
+				 * page to have PageReclaim set next time memcg
+				 * reclaim reaches the tests above, so it will
+				 * then wait_on_page_writeback() to avoid OOM;
+				 * and it's also appropriate in global reclaim.
+				 */
+				SetPageReclaim(page);
+				nr_writeback++;
 				goto keep_locked;
+			}
+			wait_on_page_writeback(page);
 		}
 
 		references = page_check_references(page, mz, sc);
@@ -1684,7 +1708,7 @@ static unsigned long shrink_list(enum lru_list lru, unsigned long nr_to_scan,
 static void get_scan_ratio(struct mem_cgroup_zone *mz, struct scan_control *sc,
 					unsigned long *percent)
 {
-	unsigned long anon, file, free;
+	unsigned long anon, file, free, zonefile;
 	unsigned long anon_prio, file_prio;
 	unsigned long ap, fp;
 	struct zone_reclaim_stat *reclaim_stat = get_reclaim_stat(mz);
@@ -1696,9 +1720,12 @@ static void get_scan_ratio(struct mem_cgroup_zone *mz, struct scan_control *sc,
 
 	if (global_reclaim(sc)) {
 		free  = zone_page_state(mz->zone, NR_FREE_PAGES);
+		zonefile =
+		    zone_page_state(mz->zone, NR_LRU_BASE + LRU_ACTIVE_FILE) +
+		    zone_page_state(mz->zone, NR_LRU_BASE + LRU_INACTIVE_FILE);
 		/* If we have very few page cache pages,
 		   force-scan anon pages. */
-		if (unlikely(file + free <= high_wmark_pages(mz->zone))) {
+		if (unlikely(zonefile + free <= high_wmark_pages(mz->zone))) {
 			percent[0] = 100;
 			percent[1] = 0;
 			return;
@@ -1773,82 +1800,6 @@ static unsigned long nr_scan_try_batch(unsigned long nr_to_scan,
 	return nr;
 }
 
-/* Use reclaim/compaction for costly allocs or under memory pressure */
-static bool in_reclaim_compaction(int priority, struct scan_control *sc)
-{
-	if (COMPACTION_BUILD && sc->order &&
-			(sc->order > PAGE_ALLOC_COSTLY_ORDER ||
-			 priority < DEF_PRIORITY - 2))
-		return true;
-
-	return false;
-}
-
-/*
- * Reclaim/compaction is used for high-order allocation requests. It reclaims
- * order-0 pages before compacting the zone. should_continue_reclaim() returns
- * true if more pages should be reclaimed such that when the page allocator
- * calls try_to_compact_zone() that it will have enough free pages to succeed.
- * It will give up earlier than that if there is difficulty reclaiming pages.
- */
-static inline bool should_continue_reclaim(struct mem_cgroup_zone *mz,
-					unsigned long nr_reclaimed,
-					unsigned long nr_scanned,
-					int priority,
-					struct scan_control *sc)
-{
-	unsigned long pages_for_compaction;
-	unsigned long inactive_lru_pages;
-
-	/* If not in reclaim/compaction mode, stop */
-	if (!in_reclaim_compaction(priority, sc))
-		return false;
-
-	/* Consider stopping depending on scan and reclaim activity */
-	if (sc->gfp_mask & __GFP_REPEAT) {
-		/*
-		 * For __GFP_REPEAT allocations, stop reclaiming if the
-		 * full LRU list has been scanned and we are still failing
-		 * to reclaim pages. This full LRU scan is potentially
-		 * expensive but a __GFP_REPEAT caller really wants to succeed
-		 */
-		if (!nr_reclaimed && !nr_scanned)
-			return false;
-	} else {
-		/*
-		 * For non-__GFP_REPEAT allocations which can presumably
-		 * fail without consequence, stop if we failed to reclaim
-		 * any pages from the last SWAP_CLUSTER_MAX number of
-		 * pages that were scanned. This will return to the
-		 * caller faster at the risk reclaim/compaction and
-		 * the resulting allocation attempt fails
-		 */
-		if (!nr_reclaimed)
-			return false;
-	}
-
-	/*
-	 * If we have not reclaimed enough pages for compaction and the
-	 * inactive lists are large enough, continue reclaiming
-	 */
-	pages_for_compaction = (2UL << sc->order);
-	inactive_lru_pages = zone_nr_lru_pages(mz, LRU_INACTIVE_FILE);
-	if (nr_swap_pages > 0)
-		inactive_lru_pages += zone_nr_lru_pages(mz, LRU_INACTIVE_ANON);
-	if (sc->nr_reclaimed < pages_for_compaction &&
-			inactive_lru_pages > pages_for_compaction)
-		return true;
-
-	/* If compaction would go ahead or the allocation would succeed, stop */
-	switch (compaction_suitable(mz->zone, sc->order)) {
-	case COMPACT_PARTIAL:
-	case COMPACT_CONTINUE:
-		return false;
-	default:
-		return true;
-	}
-}
-
 /*
  * This is a basic per-zone page freer.  Used by both kswapd and direct reclaim.
  */
@@ -1859,14 +1810,11 @@ static void shrink_mem_cgroup_zone(int priority, struct mem_cgroup_zone *mz,
 	unsigned long nr_to_scan;
 	unsigned long percent[2];	/* anon @ 0; file @ 1 */
 	enum lru_list l;
-	unsigned long nr_reclaimed, nr_scanned;
+	unsigned long nr_reclaimed = 0;
 	unsigned long nr_to_reclaim = sc->nr_to_reclaim;
 	struct zone_reclaim_stat *reclaim_stat = get_reclaim_stat(mz);
 	int noswap = 0;
 
-restart:
-	nr_reclaimed = 0;
-	nr_scanned = sc->nr_scanned;
 	/* If we have no swap space, do not bother scanning anon pages. */
 	if (!sc->may_swap || (nr_swap_pages <= 0)) {
 		noswap = 1;
@@ -1922,49 +1870,130 @@ restart:
 	if (inactive_anon_is_low(mz) && nr_swap_pages > 0)
 		shrink_active_list(SWAP_CLUSTER_MAX, mz, sc, priority, 0);
 
-	/* reclaim/compaction might need reclaim to continue */
-	if (should_continue_reclaim(mz, nr_reclaimed,
-					sc->nr_scanned - nr_scanned,
-					priority, sc))
-		goto restart;
-
 	throttle_vm_writeout(sc->gfp_mask);
+}
+
+/* Use reclaim/compaction for costly allocs or under memory pressure */
+static bool in_reclaim_compaction(int priority, struct scan_control *sc)
+{
+	if (COMPACTION_BUILD && sc->order &&
+			(sc->order > PAGE_ALLOC_COSTLY_ORDER ||
+			 priority < DEF_PRIORITY - 2))
+		return true;
+
+	return false;
+}
+
+/*
+ * Reclaim/compaction is used for high-order allocation requests. It reclaims
+ * order-0 pages before compacting the zone. should_continue_reclaim() returns
+ * true if more pages should be reclaimed such that when the page allocator
+ * calls try_to_compact_zone() that it will have enough free pages to succeed.
+ * It will give up earlier than that if there is difficulty reclaiming pages.
+ */
+static inline bool should_continue_reclaim(struct zone *zone,
+					unsigned long nr_reclaimed,
+					unsigned long nr_scanned,
+					int priority,
+					struct scan_control *sc)
+{
+	unsigned long pages_for_compaction;
+	unsigned long inactive_lru_pages;
+
+	/* If not in reclaim/compaction mode, stop */
+	if (!in_reclaim_compaction(priority, sc))
+		return false;
+
+	/* Consider stopping depending on scan and reclaim activity */
+	if (sc->gfp_mask & __GFP_REPEAT) {
+		/*
+		 * For __GFP_REPEAT allocations, stop reclaiming if the
+		 * full LRU list has been scanned and we are still failing
+		 * to reclaim pages. This full LRU scan is potentially
+		 * expensive but a __GFP_REPEAT caller really wants to succeed
+		 */
+		if (!nr_reclaimed && !nr_scanned)
+			return false;
+	} else {
+		/*
+		 * For non-__GFP_REPEAT allocations which can presumably
+		 * fail without consequence, stop if we failed to reclaim
+		 * any pages from the last SWAP_CLUSTER_MAX number of
+		 * pages that were scanned. This will return to the
+		 * caller faster at the risk reclaim/compaction and
+		 * the resulting allocation attempt fails
+		 */
+		if (!nr_reclaimed)
+			return false;
+	}
+
+	/*
+	 * If we have not reclaimed enough pages for compaction and the
+	 * inactive lists are large enough, continue reclaiming
+	 */
+	pages_for_compaction = (2UL << sc->order);
+	inactive_lru_pages = zone_page_state(zone, NR_INACTIVE_FILE);
+	if (nr_swap_pages > 0)
+		inactive_lru_pages += zone_page_state(zone, NR_INACTIVE_ANON);
+	if (sc->nr_reclaimed < pages_for_compaction &&
+			inactive_lru_pages > pages_for_compaction)
+		return true;
+
+	/* If compaction would go ahead or the allocation would succeed, stop */
+	switch (compaction_suitable(zone, sc->order)) {
+	case COMPACT_PARTIAL:
+	case COMPACT_CONTINUE:
+		return false;
+	default:
+		return true;
+	}
 }
 
 static void shrink_zone(int priority, struct zone *zone,
 			struct scan_control *sc)
 {
-	struct mem_cgroup *root = sc->target_mem_cgroup;
-	struct mem_cgroup_reclaim_cookie reclaim = {
-		.zone = zone,
-		.priority = priority,
-	};
-	struct mem_cgroup *memcg;
+	unsigned long nr_reclaimed, nr_scanned;
 
-	memcg = mem_cgroup_iter(root, NULL, &reclaim);
 	do {
-		struct mem_cgroup_zone mz = {
-			.mem_cgroup = memcg,
+		struct mem_cgroup *root = sc->target_mem_cgroup;
+		struct mem_cgroup_reclaim_cookie reclaim = {
 			.zone = zone,
+			.priority = priority,
 		};
+		struct mem_cgroup *memcg;
 
-		shrink_mem_cgroup_zone(priority, &mz, sc);
-		/*
-		 * Limit reclaim has historically picked one memcg and
-		 * scanned it with decreasing priority levels until
-		 * nr_to_reclaim had been reclaimed.  This priority
-		 * cycle is thus over after a single memcg.
-		 *
-		 * Direct reclaim and kswapd, on the other hand, have
-		 * to scan all memory cgroups to fulfill the overall
-		 * scan target for the zone.
-		 */
-		if (!global_reclaim(sc)) {
-			mem_cgroup_iter_break(root, memcg);
-			break;
-		}
-		memcg = mem_cgroup_iter(root, memcg, &reclaim);
-	} while (memcg);
+		nr_reclaimed = sc->nr_reclaimed;
+		nr_scanned = sc->nr_scanned;
+
+		memcg = mem_cgroup_iter(root, NULL, &reclaim);
+		do {
+			struct mem_cgroup_zone mz = {
+				.mem_cgroup = memcg,
+				.zone = zone,
+			};
+
+			shrink_mem_cgroup_zone(priority, &mz, sc);
+			/*
+			 * Limit reclaim has historically picked one
+			 * memcg and scanned it with decreasing
+			 * priority levels until nr_to_reclaim had
+			 * been reclaimed.  This priority cycle is
+			 * thus over after a single memcg.
+			 *
+			 * Direct reclaim and kswapd, on the other
+			 * hand, have to scan all memory cgroups to
+			 * fulfill the overall scan target for the
+			 * zone.
+			 */
+			if (!global_reclaim(sc)) {
+				mem_cgroup_iter_break(root, memcg);
+				break;
+			}
+			memcg = mem_cgroup_iter(root, memcg, &reclaim);
+		} while (memcg);
+	} while (should_continue_reclaim(zone, sc->nr_reclaimed - nr_reclaimed,
+					 sc->nr_scanned - nr_scanned, priority,
+					 sc));
 }
 
 /* Returns true if compaction should go ahead for a high-order request */
@@ -2413,7 +2442,7 @@ loop_again:
 	for (i = 0; i < pgdat->nr_zones; i++)
 		temp_priority[i] = DEF_PRIORITY;
 
-	for (priority = DEF_PRIORITY; priority >= 0; priority--) {
+	for (priority = DEF_PRIORITY; priority >= 1; priority--) {
 		int end_zone = 0;	/* Inclusive.  0 = ZONE_DMA */
 		unsigned long lru_pages = 0;
 		int has_under_min_watermark_zone = 0;
@@ -3002,6 +3031,18 @@ static int __zone_reclaim(struct zone *zone, gfp_t gfp_mask, unsigned int order)
 		.order = order,
 	};
 	unsigned long slab_reclaimable;
+
+	/*
+	 * RHEL6: we have removed the ZONE_RECLAIM_LOCKED scheme in order to
+	 * allow reclaim threads performing concurrent scans for a given zone.
+	 * This bailout is now required here to avoid time wasting zone scans
+	 * when a thread is about to start scanning a zone that cannot satisfy
+	 * the scan requirements anymore. It's better to give up and go scan
+	 * another zone in fallback list to prevent wasting cycles on a scan
+	 * that will not produce good results for now.
+	 */
+	if (zone_pagecache_reclaimable(zone) < sc.nr_to_reclaim)
+		return ZONE_RECLAIM_NOSCAN;
 
 	disable_swap_token();
 	cond_resched();

@@ -447,6 +447,10 @@ static inline unsigned long get_mm_hiwater_vm(struct mm_struct *mm)
 extern void set_dumpable(struct mm_struct *mm, int value);
 extern int get_dumpable(struct mm_struct *mm);
 
+#define SUID_DUMP_DISABLE	0	/* No setuid dumping */
+#define SUID_DUMP_USER		1	/* Dump as user of process */
+#define SUID_DUMP_ROOT		2	/* Dump as root */
+
 /* mm flags */
 /* dumpable bits */
 #define MMF_DUMPABLE      0  /* core dump is permitted */
@@ -720,7 +724,7 @@ struct signal_struct {
 #define SIGNAL_STOP_DEQUEUED	0x00000002 /* stop signal dequeued */
 #define SIGNAL_STOP_CONTINUED	0x00000004 /* SIGCONT since WCONTINUED reap */
 #define SIGNAL_GROUP_EXIT	0x00000008 /* group exit in progress */
-#define SIGNAL_GROUP_COREDUMP	0x00000010 /* coredump in progress */
+#define SIGNAL_GROUP_COREDUMP	0x00000080 /* coredump in progress */
 /*
  * Pending notifications to parent.
  */
@@ -1010,6 +1014,11 @@ struct sched_domain {
 
 	u64 last_update;
 
+#ifndef __GENKSYMS__
+	/* idle_balance() stats */
+	u64 max_newidle_lb_cost;
+	unsigned long next_decay_max_lb_cost;
+#endif
 #ifdef CONFIG_SCHEDSTATS
 	/* load_balance() stats */
 	unsigned int lb_count[CPU_MAX_IDLE_TYPES];
@@ -1657,7 +1666,7 @@ struct task_struct {
 	/* bitmask of trace recursion */
 	unsigned long trace_recursion;
 #endif /* CONFIG_TRACING */
-	/* reserved for Red Hat */
+	/* padding reserved by Red Hat for non-kABI breaking extensions */
 	unsigned long rh_reserved[2];
 #ifndef __GENKSYMS__
 	struct perf_event_context *perf_event_ctxp[perf_nr_task_contexts];
@@ -1668,6 +1677,9 @@ struct task_struct {
 		unsigned long bytes; 		/* uncharged usage */
 		unsigned long memsw_bytes; /* uncharged mem+swap usage */
 	} memcg_batch;
+#endif
+#ifdef CONFIG_NUMA
+	short pref_node_fork;
 #endif
 #endif
 };

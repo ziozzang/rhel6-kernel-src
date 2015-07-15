@@ -28,6 +28,7 @@
 #include <net/transp_v6.h>
 #include <net/ip6_route.h>
 #include <net/tcp_states.h>
+#include <net/dsfield.h>
 
 #include <linux/errqueue.h>
 #include <asm/uaccess.h>
@@ -288,7 +289,7 @@ void ipv6_local_error(struct sock *sk, int err, struct flowi *fl, u32 info)
 /*
  *	Handle MSG_ERRQUEUE
  */
-int ipv6_recv_error(struct sock *sk, struct msghdr *msg, int len)
+int ipv6_recv_error(struct sock *sk, struct msghdr *msg, int len, int *addr_len)
 {
 	struct ipv6_pinfo *np = inet6_sk(sk);
 	struct sock_exterr_skb *serr;
@@ -340,6 +341,7 @@ int ipv6_recv_error(struct sock *sk, struct msghdr *msg, int len)
 				      htonl(0xffff),
 				      *(__be32 *)(nh + serr->addr_offset));
 		}
+		*addr_len = sizeof(*sin);
 	}
 
 	memcpy(&errhdr.ee, &serr->ee, sizeof(struct sock_extended_err));
@@ -348,6 +350,7 @@ int ipv6_recv_error(struct sock *sk, struct msghdr *msg, int len)
 	if (serr->ee.ee_origin != SO_EE_ORIGIN_LOCAL) {
 		sin->sin6_family = AF_INET6;
 		sin->sin6_flowinfo = 0;
+		sin->sin6_port = 0;
 		sin->sin6_scope_id = 0;
 		if (serr->ee.ee_origin == SO_EE_ORIGIN_ICMP6) {
 			ipv6_addr_copy(&sin->sin6_addr, &ipv6_hdr(skb)->saddr);
@@ -411,7 +414,7 @@ int datagram_recv_ctl(struct sock *sk, struct msghdr *msg, struct sk_buff *skb)
 	}
 
 	if (np->rxopt.bits.rxtclass) {
-		int tclass = ipv6_tclass(ipv6_hdr(skb));
+		int tclass = ipv6_get_dsfield(ipv6_hdr(skb));
 		put_cmsg(msg, SOL_IPV6, IPV6_TCLASS, sizeof(tclass), &tclass);
 	}
 
@@ -770,4 +773,31 @@ int datagram_send_ctl(struct net *net,
 
 exit_f:
 	return err;
+}
+
+void ip6_dgram_sock_seq_show(struct seq_file *seq, struct sock *sp,
+			     __u16 srcp, __u16 destp, int bucket)
+{
+	struct ipv6_pinfo *np = inet6_sk(sp);
+	const struct in6_addr *dest, *src;
+
+	dest  = &np->daddr;
+	src   = &np->rcv_saddr;
+	seq_printf(seq,
+		   "%4d: %08X%08X%08X%08X:%04X %08X%08X%08X%08X:%04X "
+		   "%02X %08X:%08X %02X:%08lX %08X %5u %8d %lu %d %p %d\n",
+		   bucket,
+		   src->s6_addr32[0], src->s6_addr32[1],
+		   src->s6_addr32[2], src->s6_addr32[3], srcp,
+		   dest->s6_addr32[0], dest->s6_addr32[1],
+		   dest->s6_addr32[2], dest->s6_addr32[3], destp,
+		   sp->sk_state,
+		   sk_wmem_alloc_get(sp),
+		   sk_rmem_alloc_get(sp),
+		   0, 0L, 0,
+		   sock_i_uid(sp),
+		   0,
+		   sock_i_ino(sp),
+		   atomic_read(&sp->sk_refcnt), sp,
+		   atomic_read(&sp->sk_drops));
 }

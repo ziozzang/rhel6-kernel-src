@@ -2363,7 +2363,10 @@ static int task_switch_interception(struct vcpu_svm *svm)
 	     (int_vec == OF_VECTOR || int_vec == BP_VECTOR)))
 		skip_emulated_instruction(&svm->vcpu);
 
-	return kvm_task_switch(&svm->vcpu, tss_selector, reason,
+	if (int_type != SVM_EXITINTINFO_TYPE_SOFT)
+		int_vec = -1;
+
+	return kvm_task_switch(&svm->vcpu, tss_selector, int_vec, reason,
 			       has_error_code, error_code);
 }
 
@@ -3359,9 +3362,9 @@ static bool svm_invpcid_supported(void)
 	return false;
 }
 
-static bool svm_gb_page_enable(void)
+static int svm_get_lpage_level(void)
 {
-	return true;
+	return PT_PDPE_LEVEL;
 }
 
 static void svm_fpu_deactivate(struct kvm_vcpu *vcpu)
@@ -3378,6 +3381,10 @@ static void svm_fpu_deactivate(struct kvm_vcpu *vcpu)
 	svm->vmcb->save.cr0 |= X86_CR0_TS;
 	mark_dirty(svm->vmcb, VMCB_INTERCEPTS);
 	mark_dirty(svm->vmcb, VMCB_CR);
+}
+
+static void svm_sched_in(struct kvm_vcpu *vcpu, int cpu)
+{
 }
 
 static struct kvm_x86_ops svm_x86_ops = {
@@ -3446,7 +3453,7 @@ static struct kvm_x86_ops svm_x86_ops = {
 	.get_tdp_level = get_npt_level,
 	.get_mt_mask = svm_get_mt_mask,
 
-	.gb_page_enable = svm_gb_page_enable,
+	.get_lpage_level = svm_get_lpage_level,
 
 	.cpuid_update = svm_cpuid_update,
 	.invpcid_supported = svm_invpcid_supported,
@@ -3455,6 +3462,8 @@ static struct kvm_x86_ops svm_x86_ops = {
 	.write_tsc_offset = svm_write_tsc_offset,
 	.adjust_tsc_offset = svm_adjust_tsc_offset,
 	.compute_tsc_offset = svm_compute_tsc_offset,
+
+	.sched_in = svm_sched_in,
 };
 
 static int __init svm_init(void)

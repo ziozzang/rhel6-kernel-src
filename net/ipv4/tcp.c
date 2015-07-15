@@ -274,6 +274,7 @@
 
 #include <asm/uaccess.h>
 #include <asm/ioctls.h>
+#include <net/busy_poll.h>
 
 int sysctl_tcp_fin_timeout __read_mostly = TCP_FIN_TIMEOUT;
 
@@ -732,12 +733,6 @@ static unsigned int tcp_xmit_size_goal(struct sock *sk, u32 mss_now,
 
 		xmit_size_goal = min_t(u32, gso_size,
 				       sk->sk_gso_max_size - 1 - hlen);
-
-		/* TSQ : try to have at least two segments in flight
-		 * (one in NIC TX ring, another in Qdisc)
-		 */
-		xmit_size_goal = min_t(u32, xmit_size_goal,
-				       sysctl_tcp_limit_output_bytes >> 1);
 
 		xmit_size_goal = tcp_bound_to_half_wnd(tp, xmit_size_goal);
 
@@ -1397,6 +1392,10 @@ int tcp_recvmsg(struct kiocb *iocb, struct sock *sk, struct msghdr *msg,
 	int copied_early = 0;
 	struct sk_buff *skb;
 	u32 urg_hole = 0;
+
+	if (sk_can_busy_loop(sk) && skb_queue_empty(&sk->sk_receive_queue) &&
+	    (sk->sk_state == TCP_ESTABLISHED))
+		sk_busy_loop(sk, nonblock);
 
 	lock_sock(sk);
 

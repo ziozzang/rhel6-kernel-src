@@ -653,6 +653,15 @@ static int __init setup_elfcorehdr(char *arg)
 early_param("elfcorehdr", setup_elfcorehdr);
 #endif
 
+static bool __read_mostly map_individual_e820;
+static int __init setup_map_individual_e820(char *str)
+{
+	map_individual_e820 = 1;
+
+	return 0;
+}
+early_param("map_individual_e820", setup_map_individual_e820);
+
 static __init void reserve_ibft_region(void)
 {
 	unsigned long addr, size = 0;
@@ -748,6 +757,15 @@ static void rh_check_supported(void)
 	/* The RHEL kernel does not support this hardware.  The kernel will
 	 * attempt to boot, but no support is given for this hardware */
 
+
+	/*
+	* Check if we are running on VMware's hypervisor and bail out
+	* if we are.  They run their own hypervisor and have different
+	* support requirements than we do.
+	*/
+	if (x86_hyper == &x86_hyper_vmware)
+		return;
+
 	/* RHEL only supports Intel and AMD processors */
 	if ((boot_cpu_data.x86_vendor != X86_VENDOR_INTEL) &&
 	    (boot_cpu_data.x86_vendor != X86_VENDOR_AMD)) {
@@ -765,6 +783,7 @@ static void rh_check_supported(void)
 		case 70: /* Crystal Well */
 		case 63: /* Grantley/Haswell EP */
 		case 62: /* Ivy Town */
+		case 61: /* Broadwell */
 			break;
 		default:
 			if (boot_cpu_data.x86_model > 60) {
@@ -927,6 +946,7 @@ void __init setup_arch(char **cmdline_p)
 		efi_init();
 
 	dmi_scan_machine();
+	dmi_memdev_walk();
 
 	dmi_check_system(bad_bios_dmi_table);
 
@@ -1005,10 +1025,51 @@ void __init setup_arch(char **cmdline_p)
 
 #ifdef CONFIG_X86_64
 	if (max_pfn > max_low_pfn) {
-		max_pfn_mapped = init_memory_mapping(1UL<<32,
-						     max_pfn<<PAGE_SHIFT);
-		/* can we preseve max_low_pfn ?*/
-		max_low_pfn = max_pfn;
+		if (!map_individual_e820) {
+			printk(KERN_DEBUG "Use unified mapping for non-reserved e820 regions.\n");
+			max_pfn_mapped = init_memory_mapping(1UL<<32,
+							     max_pfn<<PAGE_SHIFT);
+
+			/* can we preseve max_low_pfn ?*/
+			max_low_pfn = max_pfn;
+		} else {
+			int i;
+			__u64 map_begin = 0, map_end = 0;
+
+			printk(KERN_DEBUG "Use individual mapping for non-reserved e820 regions.\n");
+
+			/*
+			 * We are grouping contiguous E820 "usable" regions together
+			 * into one mapping (eventhough there is a small whole), 
+			 * and separated by "reserved" region.
+			 */
+			
+			for (i = 0; i < e820.nr_map; i++) {
+				struct e820entry *ei = &e820.map[i];
+
+				if (ei->addr + ei->size <= 1UL << 32)
+					continue;
+
+				if (ei->type == E820_RESERVED) {
+					if (map_begin != 0) {
+						max_pfn_mapped = init_memory_mapping(map_begin, map_end);
+						map_begin = 0;
+						map_end = 0;
+					}
+					continue;
+				}
+
+				if (map_begin == 0)
+					map_begin = (ei->addr < (1UL << 32)) ? (1UL << 32) : ei->addr;
+				map_end = ei->addr + ei->size;
+			}
+
+			if (map_begin != 0)
+				max_pfn_mapped = init_memory_mapping(map_begin, map_end);
+
+			/* can we preseve max_low_pfn ?*/
+			max_low_pfn = max_pfn;
+		}
 	}
 #endif
 

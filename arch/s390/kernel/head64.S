@@ -79,9 +79,7 @@ startup_continue:
 #else
 	lhi	%r1,1			# mode 1 = esame (normal ipl)
 #endif /* CONFIG_ZFCPDUMP */
-	mvi	__LC_AR_MODE_ID,1	# set esame flag
-	slr	%r0,%r0 		# set cpuid to zero
-	sigp	%r1,%r0,0x12		# switch to esame mode
+	/* Continue with 64bit startup code in head64.S */
 	sam64				# switch to 64 bit mode
 	llgfr	%r13,%r13		# clear high-order half of base reg
 	lmh	%r0,%r15,.Lzero64-.LPG1(%r13)	# clear high-order half
@@ -124,7 +122,7 @@ startup_continue:
 	.quad	0			# cr12: tracing off
 	.quad	0			# cr13: home space segment table
 	.quad	0xc0000000		# cr14: machine check handling off
-	.quad	0			# cr15: linkage stack operations
+	.quad	.Llinkage_stack		# cr15: linkage stack operations
 .Lpcmsk:.quad	0x0000000180000000
 .L4malign:.quad 0xffffffffffc00000
 .Lscan2g:.quad	0x80000000 + 0x20000 - 8	# 2GB + 128K - 8
@@ -139,12 +137,15 @@ startup_continue:
 .Lparmaddr:
 	.quad	PARMAREA
 	.align	64
-.Lduct: .long	0,0,0,0,.Lduald,0,0,0
+.Lduct: .long	0,.Laste,.Laste,0,.Lduald,0,0,0
 	.long	0,0,0,0,0,0,0,0
+.Laste:	.quad	0,0xffffffffffffffff,0,0,0,0,0,0
 	.align	128
 .Lduald:.rept	8
 	.long	0x80000000,0,0,0	# invalid access-list entries
 	.endr
+.Llinkage_stack:
+	.long	0,0,0x89000000,0,0,0,0x8a000000,0
 
 	.org	0x12000
 	.globl	_ehead

@@ -417,6 +417,8 @@ struct xfs_cil {
 	struct list_head	xc_committing;
 	wait_queue_head_t	xc_commit_wait;
 	xfs_lsn_t		xc_current_sequence;
+	struct work_struct	xc_push_work;
+	xfs_lsn_t		xc_push_seq;
 };
 
 /*
@@ -630,6 +632,7 @@ xlog_assign_grant_head(atomic64_t *head, int cycle, int space)
 int	xlog_cil_init(struct log *log);
 void	xlog_cil_init_post_recovery(struct log *log);
 void	xlog_cil_destroy(struct log *log);
+bool	xlog_cil_empty(struct log *log);
 
 /*
  * CIL force routines

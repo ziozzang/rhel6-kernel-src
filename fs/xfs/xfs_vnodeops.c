@@ -59,6 +59,7 @@ xfs_setattr(
 	xfs_mount_t		*mp = ip->i_mount;
 	struct inode		*inode = VFS_I(ip);
 	int			mask = iattr->ia_valid;
+	xfs_off_t		oldsize, newsize;
 	xfs_trans_t		*tp;
 	int			code;
 	uint			lock_flags = 0;
@@ -184,11 +185,12 @@ restart:
 	 * Truncate file.  Must have write permission and not be a directory.
 	 */
 	if (mask & ATTR_SIZE) {
-		loff_t	old_size = XFS_ISIZE(ip);
+
+		oldsize = XFS_ISIZE(ip);
+		newsize = iattr->ia_size;
 
 		/* Short circuit the truncate case for zero length files */
-		if (iattr->ia_size == 0 &&
-		    old_size == 0 && ip->i_d.di_nextents == 0) {
+		if (newsize == 0 && oldsize == 0 && ip->i_d.di_nextents == 0) {
 			if (mask & ATTR_CTIME) {
 				/* need to log timestamp changes */
 				iattr->ia_ctime = iattr->ia_mtime =
@@ -226,14 +228,14 @@ restart:
 		 * to the transaction, because the inode cannot be unlocked
 		 * once it is a part of the transaction.
 		 */
-		if (iattr->ia_size > old_size) {
+		if (newsize > oldsize) {
 			/*
 			 * Do the first part of growing a file: zero any data
 			 * in the last block that is beyond the old EOF.  We
 			 * need to do this before the inode is joined to the
 			 * transaction to modify the i_size.
 			 */
-			code = xfs_zero_eof(ip, iattr->ia_size, old_size);
+			code = xfs_zero_eof(ip, newsize, oldsize);
 			if (code)
 				goto error_return;
 		}
@@ -250,11 +252,9 @@ restart:
 		 * really care about here and prevents waiting for other data
 		 * not within the range we care about here.
 		 */
-		if (old_size != ip->i_d.di_size &&
-		    iattr->ia_size > ip->i_d.di_size) {
-			code = xfs_flush_pages(ip,
-					ip->i_d.di_size, iattr->ia_size,
-					0, FI_NONE);
+		if (oldsize != ip->i_d.di_size && newsize > ip->i_d.di_size) {
+			code = xfs_flush_pages(ip, ip->i_d.di_size, newsize, 0,
+					       FI_NONE);
 			if (code)
 				goto error_return;
 		}
@@ -262,7 +262,7 @@ restart:
 		/* wait for all I/O to complete */
 		xfs_ioend_wait(ip);
 
-		code = -block_truncate_page(inode->i_mapping, iattr->ia_size,
+		code = -block_truncate_page(inode->i_mapping, newsize,
 					    xfs_get_blocks);
 		if (code)
 			goto error_return;
@@ -274,7 +274,7 @@ restart:
 		if (code)
 			goto error_return;
 
-		truncate_setsize(inode, iattr->ia_size);
+		truncate_setsize(inode, newsize);
 
 		commit_flags = XFS_TRANS_RELEASE_LOG_RES;
 		lock_flags |= XFS_ILOCK_EXCL;
@@ -295,20 +295,32 @@ restart:
 		 * VFS set these flags explicitly if it wants a timestamp
 		 * update.
 		 */
-		if (iattr->ia_size != old_size &&
+		if (newsize != oldsize &&
 		    (!(mask & (ATTR_CTIME | ATTR_MTIME)))) {
 			iattr->ia_ctime = iattr->ia_mtime =
 				current_fs_time(inode->i_sb);
 			mask |= ATTR_CTIME | ATTR_MTIME;
 		}
 
-		if (iattr->ia_size > old_size) {
-			ip->i_d.di_size = iattr->ia_size;
-			xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
-		} else if (iattr->ia_size <= old_size ||
-			   (iattr->ia_size == 0 && ip->i_d.di_nextents)) {
-			code = xfs_itruncate_finish(&tp, ip, iattr->ia_size,
-						    XFS_DATA_FORK);
+		/*
+		 * The first thing we do is set the size to new_size permanently
+		 * on disk.  This way we don't have to worry about anyone ever
+		 * being able to look at the data being freed even in the face
+		 * of a crash.  What we're getting around here is the case where
+		 * we free a block, it is allocated to another file, it is
+		 * written to, and then we crash.  If the new data gets written
+		 * to the file but the log buffers containing the free and
+		 * reallocation don't, then we'd end up with garbage in the
+		 * blocks being freed.  As long as we make the new size
+		 * permanent before actually freeing any blocks it doesn't
+		 * matter if they get written to.
+		 */
+		ip->i_d.di_size = newsize;
+		xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+
+		if (newsize <= oldsize) {
+			code = xfs_itruncate_extents(&tp, ip, XFS_DATA_FORK,
+						     newsize);
 			if (code)
 				goto abort_return;
 			/*
@@ -617,13 +629,6 @@ xfs_free_eofblocks(
 		 */
 		tp = xfs_trans_alloc(mp, XFS_TRANS_INACTIVE);
 
-		/*
-		 * Do the xfs_itruncate_start() call before
-		 * reserving any log space because
-		 * itruncate_start will call into the buffer
-		 * cache and we can't
-		 * do that within a transaction.
-		 */
 		if (flags & XFS_FREE_EOF_TRYLOCK) {
 			if (!xfs_ilock_nowait(ip, XFS_IOLOCK_EXCL)) {
 				xfs_trans_cancel(tp, 0);
@@ -631,13 +636,6 @@ xfs_free_eofblocks(
 			}
 		} else {
 			xfs_ilock(ip, XFS_IOLOCK_EXCL);
-		}
-		error = xfs_itruncate_start(ip, XFS_ITRUNC_DEFINITE,
-				    XFS_ISIZE(ip));
-		if (error) {
-			xfs_trans_cancel(tp, 0);
-			xfs_iunlock(ip, XFS_IOLOCK_EXCL);
-			return error;
 		}
 
 		error = xfs_trans_reserve(tp, 0,
@@ -654,13 +652,19 @@ xfs_free_eofblocks(
 		xfs_ilock(ip, XFS_ILOCK_EXCL);
 		xfs_trans_ijoin(tp, ip);
 
-		error = xfs_itruncate_finish(&tp, ip, XFS_ISIZE(ip),
-					     XFS_DATA_FORK);
 		/*
-		 * If we get an error at this point we
-		 * simply don't bother truncating the file.
+		 * Do not update the on-disk file size.  If we update the
+		 * on-disk file size and then the system crashes before the
+		 * contents of the file are flushed to disk then the files
+		 * may be full of holes (ie NULL files bug).
 		 */
+		error = xfs_itruncate_extents(&tp, ip, XFS_DATA_FORK,
+					      XFS_ISIZE(ip));
 		if (error) {
+			/*
+			 * If we get an error at this point we simply don't
+			 * bother truncating the file.
+			 */
 			xfs_trans_cancel(tp,
 					 (XFS_TRANS_RELEASE_LOG_RES |
 					  XFS_TRANS_ABORT));
@@ -1079,20 +1083,9 @@ xfs_inactive(
 
 	tp = xfs_trans_alloc(mp, XFS_TRANS_INACTIVE);
 	if (truncate) {
-		/*
-		 * Do the xfs_itruncate_start() call before
-		 * reserving any log space because itruncate_start
-		 * will call into the buffer cache and we can't
-		 * do that within a transaction.
-		 */
 		xfs_ilock(ip, XFS_IOLOCK_EXCL);
 
-		error = xfs_itruncate_start(ip, XFS_ITRUNC_DEFINITE, 0);
-		if (error) {
-			xfs_trans_cancel(tp, 0);
-			xfs_iunlock(ip, XFS_IOLOCK_EXCL);
-			return VN_INACTIVE_CACHE;
-		}
+		xfs_ioend_wait(ip);
 
 		error = xfs_trans_reserve(tp, 0,
 					  XFS_ITRUNCATE_LOG_RES(mp),
@@ -1109,13 +1102,18 @@ xfs_inactive(
 		xfs_ilock(ip, XFS_ILOCK_EXCL);
 		xfs_trans_ijoin(tp, ip);
 
-		error = xfs_itruncate_finish(&tp, ip, 0, XFS_DATA_FORK);
+		ip->i_d.di_size = 0;
+		xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+
+		error = xfs_itruncate_extents(&tp, ip, XFS_DATA_FORK, 0);
 		if (error) {
 			xfs_trans_cancel(tp,
 				XFS_TRANS_RELEASE_LOG_RES | XFS_TRANS_ABORT);
 			xfs_iunlock(ip, XFS_IOLOCK_EXCL | XFS_ILOCK_EXCL);
 			return VN_INACTIVE_CACHE;
 		}
+
+		ASSERT(ip->i_d.di_nextents == 0);
 	} else if ((ip->i_d.di_mode & S_IFMT) == S_IFLNK) {
 
 		/*
@@ -1640,6 +1638,33 @@ xfs_lock_two_inodes(
 	}
 }
 
+/*
+ * Removing an inode from the namespace involves removing the directory entry
+ * and dropping the link count on the inode. Removing the directory entry can
+ * result in locking an AGF (directory blocks were freed) and removing a link
+ * count can result in placing the inode on an unlinked list which results in
+ * locking an AGI.
+ *
+ * The big problem here is that we have an ordering constraint on AGF and AGI
+ * locking - inode allocation locks the AGI, then can allocate a new extent for
+ * new inodes, locking the AGF after the AGI. Similarly, freeing the inode
+ * removes the inode from the unlinked list, requiring that we lock the AGI
+ * first, and then freeing the inode can result in an inode chunk being freed
+ * and hence freeing disk space requiring that we lock an AGF.
+ *
+ * Hence the ordering that is imposed by other parts of the code is AGI before
+ * AGF. This means we cannot remove the directory entry before we drop the inode
+ * reference count and put it on the unlinked list as this results in a lock
+ * order of AGF then AGI, and this can deadlock against inode allocation and
+ * freeing. Therefore we must drop the link counts before we remove the
+ * directory entry.
+ *
+ * This is still safe from a transactional point of view - it is not until we
+ * get to xfs_bmap_finish() that we have the possibility of multiple
+ * transactions in this operation. Hence as long as we remove the directory
+ * entry and drop the link count in the first transaction of the remove
+ * operation, there are no transactional constraints on the ordering here.
+ */
 int
 xfs_remove(
 	xfs_inode_t             *dp,
@@ -1711,6 +1736,7 @@ xfs_remove(
 	/*
 	 * If we're removing a directory perform some additional validation.
 	 */
+	cancel_flags |= XFS_TRANS_ABORT;
 	if (is_dir) {
 		ASSERT(ip->i_d.di_nlink >= 2);
 		if (ip->i_d.di_nlink != 2) {
@@ -1721,31 +1747,16 @@ xfs_remove(
 			error = XFS_ERROR(ENOTEMPTY);
 			goto out_trans_cancel;
 		}
-	}
 
-	xfs_bmap_init(&free_list, &first_block);
-	error = xfs_dir_removename(tp, dp, name, ip->i_ino,
-					&first_block, &free_list, resblks);
-	if (error) {
-		ASSERT(error != ENOENT);
-		goto out_bmap_cancel;
-	}
-	xfs_trans_ichgtime(tp, dp, XFS_ICHGTIME_MOD | XFS_ICHGTIME_CHG);
-
-	if (is_dir) {
-		/*
-		 * Drop the link from ip's "..".
-		 */
+		/* Drop the link from ip's "..".  */
 		error = xfs_droplink(tp, dp);
 		if (error)
-			goto out_bmap_cancel;
+			goto out_trans_cancel;
 
-		/*
-		 * Drop the "." link from ip to self.
-		 */
+		/* Drop the "." link from ip to self.  */
 		error = xfs_droplink(tp, ip);
 		if (error)
-			goto out_bmap_cancel;
+			goto out_trans_cancel;
 	} else {
 		/*
 		 * When removing a non-directory we need to log the parent
@@ -1754,19 +1765,23 @@ xfs_remove(
 		 */
 		xfs_trans_log_inode(tp, dp, XFS_ILOG_CORE);
 	}
+	xfs_trans_ichgtime(tp, dp, XFS_ICHGTIME_MOD | XFS_ICHGTIME_CHG);
 
-	/*
-	 * Drop the link from dp to ip.
-	 */
+	/* Drop the link from dp to ip. */
 	error = xfs_droplink(tp, ip);
 	if (error)
-		goto out_bmap_cancel;
+		goto out_trans_cancel;
 
-	/*
-	 * Determine if this is the last link while
-	 * we are in the transaction.
-	 */
+	/* Determine if this is the last link while the inode is locked */
 	link_zero = (ip->i_d.di_nlink == 0);
+
+	xfs_bmap_init(&free_list, &first_block);
+	error = xfs_dir_removename(tp, dp, name, ip->i_ino,
+					&first_block, &free_list, resblks);
+	if (error) {
+		ASSERT(error != ENOENT);
+		goto out_bmap_cancel;
+	}
 
 	/*
 	 * If this is a synchronous mount, make sure that the
@@ -1797,7 +1812,6 @@ xfs_remove(
 
  out_bmap_cancel:
 	xfs_bmap_cancel(&free_list);
-	cancel_flags |= XFS_TRANS_ABORT;
  out_trans_cancel:
 	xfs_trans_cancel(tp, cancel_flags);
  std_return:
