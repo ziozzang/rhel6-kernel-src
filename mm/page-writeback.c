@@ -146,6 +146,25 @@ static int calc_period_shift(void)
 	else
 		dirty_total = (vm_dirty_ratio * determine_dirtyable_memory()) /
 				100;
+	/*
+	 * RHEL6: When an user sets vm.dirty_ratio=0 we trigger havoc that
+	 * creates the barbed wire which leads to the kernel panic described
+	 * at  BZ#871599.
+	 *
+	 * As dirty_total is from unsigned long type, doing dirty total - 1
+	 * means we're calling for ilog2(ULONG_MAX), thus calc_periodic_shift()
+	 * will return 66.
+	 * Also, if we are unlucky enough to get dirty_total becoming 1, we
+	 * can potentially trigger unexpected behavior, as  ilog2(0) == NaN.
+	 *
+	 * That's why we need to certify the lower limit of dirty_total never
+	 * gets smaller than 2, as ilog2(1) == 0, and for such cases
+	 * calc_periodic_shift() will always return the smaller period shift
+	 * expected (2).
+	 */
+	if (dirty_total < 2)
+		dirty_total = 2;
+
 	return 2 + ilog2(dirty_total - 1);
 }
 
@@ -1401,3 +1420,27 @@ int mapping_tagged(struct address_space *mapping, int tag)
 	return ret;
 }
 EXPORT_SYMBOL(mapping_tagged);
+
+/**
+ * wait_for_stable_page() - wait for writeback to finish, if necessary.
+ * @page:	The page to wait on.
+ *
+ * This function determines if the given page is related to a backing device
+ * that requires page contents to be held stable during writeback.  If so, then
+ * it will wait for any pending writeback to complete.
+ */
+void wait_for_stable_page(struct page *page)
+{
+	struct address_space *mapping = page_mapping(page);
+	struct backing_dev_info *bdi = mapping->backing_dev_info;
+
+	if (!bdi_cap_stable_pages_required(bdi))
+		return;
+#ifdef CONFIG_NEED_BOUNCE_POOL
+	if (mapping->host->i_sb->s_flags & MS_SNAP_STABLE)
+		return;
+#endif /* CONFIG_NEED_BOUNCE_POOL */
+
+	wait_on_page_writeback(page);
+}
+EXPORT_SYMBOL_GPL(wait_for_stable_page);

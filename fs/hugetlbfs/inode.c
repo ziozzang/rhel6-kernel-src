@@ -134,6 +134,7 @@ hugetlb_get_unmapped_area(struct file *file, unsigned long addr,
 	struct vm_area_struct *vma;
 	unsigned long start_addr;
 	struct hstate *h = hstate_file(file);
+	unsigned int unmap_factor = sysctl_unmap_area_factor;
 
 	if (len & ~huge_page_mask(h))
 		return -EINVAL;
@@ -156,7 +157,7 @@ hugetlb_get_unmapped_area(struct file *file, unsigned long addr,
 
 	start_addr = mm->free_area_cache;
 
-	if (len <= mm->cached_hole_size)
+	if (len <= mm->cached_hole_size && !unmap_factor)
 		start_addr = TASK_UNMAPPED_BASE;
 
 full_search:
@@ -935,8 +936,11 @@ struct file *hugetlb_file_setup(const char *name, size_t size, int acctflag,
 	if (creat_flags == HUGETLB_SHMFS_INODE && !can_do_hugetlb_shm()) {
 		*user = current_user();
 		if (user_shm_lock(size, *user)) {
-			WARN_ONCE(1,
-			  "Using mlock ulimits for SHM_HUGETLB deprecated\n");
+			task_lock(current);
+			printk_once(KERN_WARNING
+				"%s (%d): Using mlock ulimits for SHM_HUGETLB is deprecated\n",
+				current->comm, current->pid);
+			task_unlock(current);
 		} else {
 			*user = NULL;
 			return ERR_PTR(-EPERM);

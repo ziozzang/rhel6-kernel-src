@@ -67,7 +67,7 @@ struct wb_writeback_work {
  */
 int writeback_in_progress(struct backing_dev_info *bdi)
 {
-	return !list_empty(&bdi->work_list);
+	return test_bit(BDI_writeback_running, &bdi->state);
 }
 
 static void bdi_queue_work(struct backing_dev_info *bdi,
@@ -479,12 +479,6 @@ static int writeback_sb_inodes(struct super_block *sb, struct bdi_writeback *wb,
 			requeue_io(inode);
 			continue;
 		}
-		/*
-		 * Was this inode dirtied after sync_sb_inodes was called?
-		 * This keeps sync from extra jobs and livelock.
-		 */
-		if (inode_dirtied_after(inode, wbc->wb_start))
-			return 1;
 
 		BUG_ON(inode->i_state & (I_FREEING | I_CLEAR));
 		__iget(inode);
@@ -517,6 +511,10 @@ void writeback_inodes_wb(struct bdi_writeback *wb,
 {
 	int ret = 0;
 
+	/*
+	 * XXX ERS: wb_start no longer used here, but updated in
+	 * case any out of tree user is looking at it
+	 */ 
 	if (!wbc->wb_start)
 		wbc->wb_start = jiffies; /* livelock avoidance */
 	spin_lock(&inode_lock);
@@ -602,17 +600,20 @@ static long wb_writeback(struct bdi_writeback *wb,
 	long wrote = 0;
 	struct inode *inode;
 
-	if (wbc.for_kupdate) {
-		wbc.older_than_this = &oldest_jif;
-		oldest_jif = jiffies -
-				msecs_to_jiffies(dirty_expire_interval * 10);
-	}
 	if (!wbc.range_cyclic) {
 		wbc.range_start = 0;
 		wbc.range_end = LLONG_MAX;
 	}
 
+	/*
+	 * XXX ERS: wb_start no longer used here, but updated in
+	 * case any out of tree user is looking at it
+	 */ 
 	wbc.wb_start = jiffies; /* livelock avoidance */
+
+	oldest_jif = jiffies;
+	wbc.older_than_this = &oldest_jif;
+
 	for (;;) {
 		/*
 		 * Stop writeback when nr_pages has been consumed
@@ -626,6 +627,12 @@ static long wb_writeback(struct bdi_writeback *wb,
 		 */
 		if (work->for_background && !over_bground_thresh())
 			break;
+
+		if (work->for_kupdate) {
+			oldest_jif = jiffies -
+				msecs_to_jiffies(dirty_expire_interval * 10);
+			wbc.older_than_this = &oldest_jif;
+		}
 
 		wbc.more_io = 0;
 		wbc.nr_to_write = MAX_WRITEBACK_PAGES;
@@ -737,6 +744,7 @@ long wb_do_writeback(struct bdi_writeback *wb, int force_wait)
 	struct wb_writeback_work *work;
 	long wrote = 0;
 
+	set_bit(BDI_writeback_running, &wb->bdi->state);
 	while ((work = get_next_work_item(bdi, wb)) != NULL) {
 		/*
 		 * Override sync mode, in case we must wait for completion
@@ -764,6 +772,7 @@ long wb_do_writeback(struct bdi_writeback *wb, int force_wait)
 	 * Check for periodic writeback, kupdated() style
 	 */
 	wrote += wb_check_old_data_flush(wb);
+	clear_bit(BDI_writeback_running, &wb->bdi->state);
 
 	return wrote;
 }

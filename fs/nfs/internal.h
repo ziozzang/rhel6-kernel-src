@@ -212,6 +212,13 @@ extern void nfs_pgheader_init(struct nfs_pageio_descriptor *desc,
 			      struct nfs_pgio_header *hdr,
 			      void (*release)(struct nfs_pgio_header *hdr));
 void nfs_set_pgio_error(struct nfs_pgio_header *hdr, int error, loff_t pos);
+int nfs_iocounter_wait(struct nfs_io_counter *c);
+
+static inline void nfs_iocounter_init(struct nfs_io_counter *c)
+{
+	c->flags = 0;
+	atomic_set(&c->io_count, 0);
+}
 
 /* nfs2xdr.c */
 extern int nfs_stat_to_errno(int);
@@ -234,6 +241,7 @@ extern const u32 nfs41_maxwrite_overhead;
 /* nfs4proc.c */
 #ifdef CONFIG_NFS_V4
 extern struct rpc_procinfo nfs4_procedures[];
+void nfs_fixup_secinfo_attributes(struct nfs_fattr *fattr);
 #endif
 
 extern int nfs4_init_ds_session(struct nfs_client *clp);
@@ -495,3 +503,15 @@ unsigned int nfs_page_array_len(unsigned int base, size_t len)
 		PAGE_SIZE - 1) >> PAGE_SHIFT;
 }
 
+/*
+ * Convert a struct timespec into a 64-bit change attribute
+ *
+ * This does approximately the same thing as timespec_to_ns(),
+ * but for calculation efficiency, we multiply the seconds by
+ * 1024*1024*1024.
+ */
+static inline
+u64 nfs_timespec_to_change_attr(const struct timespec *ts)
+{
+	return ((u64)ts->tv_sec << 30) + ts->tv_nsec;
+}

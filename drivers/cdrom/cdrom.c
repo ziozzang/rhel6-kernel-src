@@ -2112,7 +2112,7 @@ static int cdrom_read_cdda_bpc(struct cdrom_device_info *cdi, __u8 __user *ubuf,
 
 		rq = blk_get_request(q, READ, GFP_KERNEL);
 		if (!rq) {
-			ret = -ENOMEM;
+			ret = -ENODEV;
 			break;
 		}
 
@@ -2832,7 +2832,7 @@ static noinline int mmc_ioctl_cdrom_read_data(struct cdrom_device_info *cdi,
 	if (lba < 0)
 		return -EINVAL;
 
-	cgc->buffer = kmalloc(blocksize, GFP_KERNEL);
+	cgc->buffer = kzalloc(blocksize, GFP_KERNEL);
 	if (cgc->buffer == NULL)
 		return -ENOMEM;
 

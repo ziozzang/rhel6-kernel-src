@@ -74,12 +74,23 @@ struct nfs_access_entry {
 	int			mask;
 };
 
+struct nfs_lockowner {
+	fl_owner_t l_owner;
+	pid_t l_pid;
+};
+
+#define NFS_IO_INPROGRESS 0
+struct nfs_io_counter {
+	unsigned long flags;
+	atomic_t io_count;
+};
+
 struct nfs_lock_context {
 	atomic_t count;
 	struct list_head list;
 	struct nfs_open_context *open_context;
-	fl_owner_t lockowner;
-	pid_t pid;
+	struct nfs_lockowner lockowner;
+	struct nfs_io_counter io_count;
 };
 
 struct nfs4_state;
@@ -92,6 +103,7 @@ struct nfs_open_context {
 
 	unsigned long flags;
 #define NFS_CONTEXT_ERROR_WRITE		(0)
+#define NFS_CONTEXT_BAD			(2)
 	int error;
 
 	struct list_head list;
@@ -350,10 +362,13 @@ extern int nfs_refresh_inode(struct inode *, struct nfs_fattr *);
 extern int nfs_post_op_update_inode(struct inode *inode, struct nfs_fattr *fattr);
 extern int nfs_post_op_update_inode_force_wcc(struct inode *inode, struct nfs_fattr *fattr);
 extern int nfs_getattr(struct vfsmount *, struct dentry *, struct kstat *);
+extern void nfs_access_add_cache(struct inode *, struct nfs_access_entry *);
+extern void nfs_access_set_mask(struct nfs_access_entry *, u32);
 extern int nfs_permission(struct inode *, int);
 extern int nfs_open(struct inode *, struct file *);
 extern int nfs_release(struct inode *, struct file *);
 extern int nfs_attribute_timeout(struct inode *inode);
+extern int nfs_attribute_cache_expired(struct inode *inode);
 extern int nfs_revalidate_inode(struct nfs_server *server, struct inode *inode);
 extern int __nfs_revalidate_inode(struct nfs_server *, struct inode *);
 extern int nfs_revalidate_mapping(struct inode *inode, struct address_space *mapping);
@@ -383,6 +398,28 @@ static inline void nfs_free_fhandle(const struct nfs_fh *fh)
 {
 	kfree(fh);
 }
+
+#ifdef RPC_DEBUG
+extern u32 _nfs_display_fhandle_hash(const struct nfs_fh *fh);
+static inline u32 nfs_display_fhandle_hash(const struct nfs_fh *fh)
+{
+	return _nfs_display_fhandle_hash(fh);
+}
+extern void _nfs_display_fhandle(const struct nfs_fh *fh, const char *caption);
+#define nfs_display_fhandle(fh, caption)			\
+	do {							\
+		if (unlikely(nfs_debug & NFSDBG_FACILITY))	\
+			_nfs_display_fhandle(fh, caption);	\
+	} while (0)
+#else
+static inline u32 nfs_display_fhandle_hash(const struct nfs_fh *fh)
+{
+}
+static inline void nfs_display_fhandle(const struct nfs_fh *fh,
+				       const char *caption)
+{
+}
+#endif
 
 /*
  * linux/fs/nfs/nfsroot.c
@@ -600,6 +637,7 @@ extern struct file_system_type nfs_fs_type;
 #define NFSDBG_FSCACHE		0x0800
 #define NFSDBG_PNFS		0x1000
 #define NFSDBG_PNFS_LD		0x2000
+#define NFSDBG_STATE		0x4000
 #define NFSDBG_ALL		0xFFFF
 
 #ifdef __KERNEL__

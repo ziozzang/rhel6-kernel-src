@@ -29,6 +29,7 @@ enum {
 	NFS_DELEGATION_NEED_RECLAIM = 0,
 	NFS_DELEGATION_RETURN,
 	NFS_DELEGATION_REFERENCED,
+	NFS_DELEGATION_RETURNING,
 };
 
 int nfs_inode_set_delegation(struct inode *inode, struct rpc_cred *cred, struct nfs_openres *res);
@@ -53,8 +54,8 @@ void nfs_delegation_reap_unclaimed(struct nfs_client *clp);
 /* NFSv4 delegation-related procedures */
 int nfs4_proc_delegreturn(struct inode *inode, struct rpc_cred *cred, const nfs4_stateid *stateid, int issync);
 int nfs4_open_delegation_recall(struct nfs_open_context *ctx, struct nfs4_state *state, const nfs4_stateid *stateid);
-int nfs4_lock_delegation_recall(struct nfs4_state *state, struct file_lock *fl);
-int nfs4_copy_delegation_stateid(nfs4_stateid *dst, struct inode *inode);
+int nfs4_lock_delegation_recall(struct file_lock *fl, struct nfs4_state *state, const nfs4_stateid *stateid);
+bool nfs4_copy_delegation_stateid(nfs4_stateid *dst, struct inode *inode, fmode_t flags);
 
 void nfs_mark_delegation_referenced(struct nfs_delegation *delegation);
 int nfs_have_delegation(struct inode *inode, fmode_t flags);
@@ -67,6 +68,7 @@ static inline int nfs_have_delegation(struct inode *inode, fmode_t flags)
 
 static inline int nfs_inode_return_delegation(struct inode *inode)
 {
+	nfs_wb_all(inode);
 	return 0;
 }
 #endif

@@ -23,6 +23,7 @@
 #include <linux/syscalls.h>
 #include <linux/uaccess.h>
 #include <linux/regset.h>
+#include <linux/utrace.h>
 
 int __ptrace_may_access(struct task_struct *task, unsigned int mode)
 {
@@ -38,7 +39,7 @@ int __ptrace_may_access(struct task_struct *task, unsigned int mode)
 	 */
 	int dumpable = 0;
 	/* Don't let security modules deny introspection */
-	if (task == current)
+	if (same_thread_group(task, current))
 		return 0;
 	rcu_read_lock();
 	tcred = __task_cred(task);
@@ -229,6 +230,8 @@ SYSCALL_DEFINE4(ptrace, long, request, long, pid, long, addr, long, data)
 		goto out_put_task_struct;
 
 	ret = arch_ptrace(child, request, addr, data);
+	if (request != PTRACE_DETACH)
+		utrace_unfreeze_stop(child);
 
  out_put_task_struct:
 	put_task_struct(child);
@@ -292,8 +295,11 @@ asmlinkage long compat_sys_ptrace(compat_long_t request, compat_long_t pid,
 	}
 
 	ret = ptrace_check_attach(child, request == PTRACE_KILL);
-	if (!ret)
+	if (!ret) {
 		ret = compat_arch_ptrace(child, request, addr, data);
+		if (request != PTRACE_DETACH)
+			utrace_unfreeze_stop(child);
+	}
 
  out_put_task_struct:
 	put_task_struct(child);

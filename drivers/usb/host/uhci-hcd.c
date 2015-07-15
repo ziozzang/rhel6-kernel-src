@@ -418,6 +418,10 @@ static irqreturn_t uhci_irq(struct usb_hcd *hcd)
 		return IRQ_NONE;
 	outw(status, uhci->io_addr + USBSTS);		/* Clear it */
 
+	spin_lock(&uhci->lock);
+	if (unlikely(!uhci->is_initialized))	/* not yet configured */
+		goto done;
+
 	if (status & ~(USBSTS_USBINT | USBSTS_ERROR | USBSTS_RD)) {
 		if (status & USBSTS_HSE)
 			dev_err(uhci_dev(uhci), "host system error, "
@@ -426,7 +430,6 @@ static irqreturn_t uhci_irq(struct usb_hcd *hcd)
 			dev_err(uhci_dev(uhci), "host controller process "
 					"error, something bad happened!\n");
 		if (status & USBSTS_HCH) {
-			spin_lock(&uhci->lock);
 			if (uhci->rh_state >= UHCI_RH_RUNNING) {
 				dev_err(uhci_dev(uhci),
 					"host controller halted, "
@@ -444,15 +447,15 @@ static irqreturn_t uhci_irq(struct usb_hcd *hcd)
 				 * pending unlinks */
 				mod_timer(&hcd->rh_timer, jiffies);
 			}
-			spin_unlock(&uhci->lock);
 		}
 	}
 
-	if (status & USBSTS_RD)
+	if (status & USBSTS_RD) {
+		spin_unlock(&uhci->lock);
 		usb_hcd_poll_rh_status(hcd);
-	else {
-		spin_lock(&uhci->lock);
+	} else {
 		uhci_scan_schedule(uhci);
+done:
 		spin_unlock(&uhci->lock);
 	}
 
@@ -542,6 +545,17 @@ static int uhci_init(struct usb_hcd *hcd)
 		port = 2;
 	}
 	uhci->rh_numports = port;
+
+	/* Intel controllers report the OverCurrent bit active on.
+	 * VIA controllers report it active off, so we'll adjust the
+	 * bit value.  (It's not standardized in the UHCI spec.)
+	 */
+	if (to_pci_dev(uhci_dev(uhci))->vendor == PCI_VENDOR_ID_VIA)
+		uhci->oc_low = 1;
+
+	/* HP's server management chip requires a longer port reset delay. */
+	if (to_pci_dev(uhci_dev(uhci))->vendor == PCI_VENDOR_ID_HP)
+		uhci->wait_for_hp = 1;
 
 	/* Kick BIOS off this hardware and reset if the controller
 	 * isn't already safely quiescent.
@@ -687,9 +701,9 @@ static int uhci_start(struct usb_hcd *hcd)
 	 */
 	mb();
 
+	spin_lock_irq(&uhci->lock);
 	configure_hc(uhci);
 	uhci->is_initialized = 1;
-	spin_lock_irq(&uhci->lock);
 	start_rh(uhci);
 	spin_unlock_irq(&uhci->lock);
 	return 0;
